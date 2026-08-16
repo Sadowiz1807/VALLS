@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="VcsDirectoryMappings">
+    <mapping directory="$PROJECT_DIR$/Transformer/Data/Raw data/JointIDSF" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/Transformer/Data/Raw data/Taskmaster" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/Transformer/Data/Raw data/dstc8-schema-guided-dialogue" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/Transformer/Data/Raw data/multiwoz" vcs="Git" />
+  </component>
+</project>

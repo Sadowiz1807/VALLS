@@ -1,0 +1,30 @@
+[
+  {
+    "app_id": "chrome",
+    "name": "Google Chrome",
+    "aliases": ["chrome", "google chrome", "trình duyệt", "trình duyệt chrome", "browser"],
+    "executable": "chrome.exe",
+    "enabled": true
+  },
+  {
+    "app_id": "spotify",
+    "name": "Spotify",
+    "aliases": ["spotify", "nghe nhạc spotify", "ứng dụng spotify"],
+    "executable": "spotify.exe",
+    "enabled": true
+  },
+  {
+    "app_id": "calculator",
+    "name": "Calculator",
+    "aliases": ["calculator", "máy tính", "calc", "bàn tính"],
+    "executable": "calc.exe",
+    "enabled": true
+  },
+  {
+    "app_id": "notepad",
+    "name": "Notepad",
+    "aliases": ["notepad", "ghi chú", "sổ tay", "text editor"],
+    "executable": "notepad.exe",
+    "enabled": true
+  }
+]

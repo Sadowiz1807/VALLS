@@ -1,0 +1,693 @@
+{
+  "project": {
+    "name": "AI_voice_assistant",
+    "task": "multi_task_semantics_and_response",
+    "initialization": "random_weights",
+    "contract_version": "2.0",
+    "baseline": "multi_task_transformer_v2"
+  },
+  "tokenizer": {
+    "library": "tokenizers",
+    "model": "unigram_bytelevel",
+    "vocab_size": 8000,
+    "path": "artifacts/multitask_v2/tokenizer.json",
+    "normalization": "NFC",
+    "special_tokens": {
+      "unk": "<UNK>",
+      "pad": "<PAD>",
+      "bos": "<BOS>",
+      "eos": "<EOS>",
+      "context_open": "<CONTEXT>",
+      "context_close": "</CONTEXT>",
+      "state_open": "<STATE>",
+      "state_close": "</STATE>",
+      "metadata_open": "<METADATA>",
+      "metadata_close": "</METADATA>",
+      "input_open": "<INPUT>",
+      "input_close": "</INPUT>",
+      "contract": "<CONTRACT:2.0>"
+    }
+  },
+  "model": {
+    "architecture": "multi_task_encoder_response_decoder",
+    "d_model": 512,
+    "encoder_layers": 6,
+    "decoder_layers": 4,
+    "attention_heads": 8,
+    "d_ff": 2048,
+    "dropout": 0.1,
+    "max_input_length": 256,
+    "max_response_length": 64,
+    "gradient_checkpointing": true,
+    "tie_response_embeddings": true
+  },
+  "ontology": {
+    "acts": [
+      "EXECUTE",
+      "ASK_CLARIFICATION",
+      "CONFIRM",
+      "CANCEL",
+      "RESPOND",
+      "UNSUPPORTED"
+    ],
+    "goals": [
+      "APPLICATION_CONTROL",
+      "MEDIA_CONTROL",
+      "WEB_OPEN",
+      "WEB_SEARCH",
+      "WEB_NAVIGATE",
+      "TAB_CONTROL",
+      "RUN_COMMAND",
+      "TASK_STATUS",
+      "SOCIAL_RESPONSE"
+    ],
+    "goal_parameters": {
+      "APPLICATION_CONTROL": {
+        "required": [
+          "action",
+          "application"
+        ],
+        "properties": {
+          "action": {
+            "enum": [
+              "OPEN",
+              "CLOSE",
+              "FOCUS"
+            ]
+          },
+          "application": {
+            "type": "dynamic"
+          }
+        }
+      },
+      "MEDIA_CONTROL": {
+        "required": [
+          "action"
+        ],
+        "properties": {
+          "action": {
+            "enum": [
+              "PLAY",
+              "PAUSE",
+              "RESUME",
+              "STOP",
+              "NEXT",
+              "PREVIOUS",
+              "VOLUME_UP",
+              "VOLUME_DOWN",
+              "SET_VOLUME"
+            ]
+          },
+          "query": {
+            "type": "dynamic"
+          },
+          "platform": {
+            "enum": [
+              "YOUTUBE",
+              "SPOTIFY",
+              "LOCAL",
+              "DEFAULT"
+            ]
+          },
+          "volume": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 100
+          }
+        }
+      },
+      "WEB_OPEN": {
+        "required": [
+          "target"
+        ],
+        "properties": {
+          "target": {
+            "type": "dynamic"
+          },
+          "browser": {
+            "type": "dynamic"
+          }
+        }
+      },
+      "WEB_SEARCH": {
+        "required": [
+          "query"
+        ],
+        "properties": {
+          "query": {
+            "type": "dynamic"
+          },
+          "engine": {
+            "type": "dynamic"
+          }
+        }
+      },
+      "WEB_NAVIGATE": {
+        "required": [
+          "action"
+        ],
+        "properties": {
+          "action": {
+            "enum": [
+              "BACK",
+              "FORWARD",
+              "REFRESH",
+              "SCROLL_UP",
+              "SCROLL_DOWN",
+              "GO_HOME"
+            ]
+          },
+          "amount": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 10
+          }
+        }
+      },
+      "TAB_CONTROL": {
+        "required": [
+          "action"
+        ],
+        "properties": {
+          "action": {
+            "enum": [
+              "NEW",
+              "CLOSE",
+              "SWITCH",
+              "REOPEN"
+            ]
+          },
+          "tab_index": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "tab_reference": {
+            "type": "dynamic"
+          }
+        }
+      },
+      "RUN_COMMAND": {
+        "required": [
+          "command_id"
+        ],
+        "properties": {
+          "command_id": {
+            "enum": [
+              "LOCK_SCREEN",
+              "SHUTDOWN_SYSTEM",
+              "RESTART_SYSTEM",
+              "SLEEP_SYSTEM",
+              "TAKE_SCREENSHOT",
+              "SET_VOLUME"
+            ]
+          },
+          "arguments": {
+            "type": "object"
+          }
+        }
+      },
+      "TASK_STATUS": {
+        "required": [],
+        "properties": {
+          "scope": {
+            "enum": [
+              "LAST_TASK",
+              "ACTIVE_TASK"
+            ]
+          }
+        }
+      },
+      "SOCIAL_RESPONSE": {
+        "required": [
+          "intent"
+        ],
+        "properties": {
+          "intent": {
+            "enum": [
+              "GREETING",
+              "THANKS",
+              "GOODBYE",
+              "ACKNOWLEDGEMENT"
+            ]
+          }
+        }
+      }
+    },
+    "state_reference_paths": {
+      "application": [
+        "state.current_target_application"
+      ],
+      "query": [
+        "state.active_media"
+      ],
+      "target": [
+        "state.active_url"
+      ],
+      "browser": [
+        "state.active_browser"
+      ],
+      "tab_reference": [
+        "state.active_browser"
+      ]
+    },
+    "commands": {
+      "LOCK_SCREEN": {},
+      "SHUTDOWN_SYSTEM": {},
+      "RESTART_SYSTEM": {},
+      "SLEEP_SYSTEM": {},
+      "TAKE_SCREENSHOT": {},
+      "SET_VOLUME": {
+        "level": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 100
+        }
+      }
+    }
+  },
+  "data": {
+    "train_path": "Data/multitask_v2_improvement_01/mixed_train_fit_16966.jsonl",
+    "validation_path": "Data/multitask_v2_improvement_01/mixed_validation_2226.jsonl",
+    "locked_test_path": "Data/multitask_v2/test_20.jsonl",
+    "required_fields": [
+      "sample_id",
+      "dialogue_id",
+      "turn_id",
+      "context",
+      "state",
+      "metadata",
+      "current_text",
+      "target",
+      "gold_response_text",
+      "response_metadata"
+    ],
+    "hard_validation_path": "Data/multitask_v2_improvement_01/hard_validation_600.jsonl"
+  },
+  "training": {
+    "seed": 42,
+    "epochs": 3,
+    "early_stopping_patience": 2,
+    "early_stopping_min_delta": 0.001,
+    "batch_size": 3,
+    "validation_batch_size": 3,
+    "gradient_accumulation_steps": 6,
+    "learning_rate": 5e-06,
+    "weight_decay": 0.01,
+    "label_smoothing": 0.1,
+    "gradient_clip_norm": 1.0,
+    "precision": "fp16_mixed",
+    "num_workers": 0,
+    "checkpoint_dir": "artifacts/vsad_command_policy_v2/checkpoints",
+    "checkpoint_prefix": "multi_task_transformer_v2",
+    "auto_resume": true,
+    "resume_from": null,
+    "log_dir": "artifacts/vsad_command_policy_v2/runs",
+    "loss_weights": {
+      "act": 1.0,
+      "goal": 1.0,
+      "parameters": 1.0,
+      "response": 1.0
+    }
+  },
+  "evaluation": {
+    "act_accuracy": 0.95,
+    "goal_macro_f1": 0.92,
+    "parameter_accuracy": 0.9,
+    "unsafe_false_execute_rate": 0.005,
+    "response_token_accuracy": 0.8,
+    "response_eos_rate": 0.99,
+    "response_empty_rate": 0.0,
+    "response_truncation_rate": 0.01,
+    "premature_success_claim_rate": 0.0,
+    "invalid_frame_rate": 0.0
+  },
+  "inference": {
+    "act_threshold": 0.0,
+    "goal_threshold": 0.0,
+    "parameter_threshold": 0.0,
+    "response_decoding": "greedy",
+    "response_temperature": 1.0
+  },
+  "labels": {
+    "acts": [
+      "EXECUTE",
+      "ASK_CLARIFICATION",
+      "CONFIRM",
+      "CANCEL",
+      "RESPOND",
+      "UNSUPPORTED"
+    ],
+    "goals": [
+      "APPLICATION_CONTROL",
+      "MEDIA_CONTROL",
+      "WEB_OPEN",
+      "WEB_SEARCH",
+      "WEB_NAVIGATE",
+      "TAB_CONTROL",
+      "RUN_COMMAND",
+      "TASK_STATUS",
+      "SOCIAL_RESPONSE",
+      "NONE"
+    ],
+    "goal_masks_by_act": {
+      "EXECUTE": [
+        "APPLICATION_CONTROL",
+        "MEDIA_CONTROL",
+        "WEB_OPEN",
+        "WEB_SEARCH",
+        "WEB_NAVIGATE",
+        "TAB_CONTROL",
+        "RUN_COMMAND"
+      ],
+      "ASK_CLARIFICATION": [
+        "APPLICATION_CONTROL",
+        "MEDIA_CONTROL",
+        "WEB_OPEN",
+        "WEB_SEARCH",
+        "WEB_NAVIGATE",
+        "TAB_CONTROL",
+        "RUN_COMMAND",
+        "TASK_STATUS",
+        "SOCIAL_RESPONSE"
+      ],
+      "RESPOND": [
+        "TASK_STATUS",
+        "SOCIAL_RESPONSE"
+      ],
+      "CONFIRM": [
+        "NONE"
+      ],
+      "CANCEL": [
+        "NONE"
+      ],
+      "UNSUPPORTED": [
+        "NONE"
+      ]
+    }
+  },
+  "heads": {
+    "categorical": {
+      "APPLICATION_CONTROL__action": [
+        "OPEN",
+        "CLOSE",
+        "FOCUS"
+      ],
+      "APPLICATION_CONTROL__application__source": [
+        "INPUT_SPAN",
+        "STATE_REFERENCE"
+      ],
+      "APPLICATION_CONTROL__application__reference": [
+        "state.current_target_application"
+      ],
+      "MEDIA_CONTROL__action": [
+        "PLAY",
+        "PAUSE",
+        "RESUME",
+        "STOP",
+        "NEXT",
+        "PREVIOUS",
+        "VOLUME_UP",
+        "VOLUME_DOWN",
+        "SET_VOLUME"
+      ],
+      "MEDIA_CONTROL__query__source": [
+        "ABSENT",
+        "INPUT_SPAN",
+        "STATE_REFERENCE"
+      ],
+      "MEDIA_CONTROL__query__reference": [
+        "state.active_media"
+      ],
+      "MEDIA_CONTROL__platform": [
+        "ABSENT",
+        "YOUTUBE",
+        "SPOTIFY",
+        "LOCAL",
+        "DEFAULT"
+      ],
+      "MEDIA_CONTROL__volume": [
+        "ABSENT",
+        "0",
+        "1",
+        "2",
+        "3",
+        "4",
+        "5",
+        "6",
+        "7",
+        "8",
+        "9",
+        "10",
+        "11",
+        "12",
+        "13",
+        "14",
+        "15",
+        "16",
+        "17",
+        "18",
+        "19",
+        "20",
+        "21",
+        "22",
+        "23",
+        "24",
+        "25",
+        "26",
+        "27",
+        "28",
+        "29",
+        "30",
+        "31",
+        "32",
+        "33",
+        "34",
+        "35",
+        "36",
+        "37",
+        "38",
+        "39",
+        "40",
+        "41",
+        "42",
+        "43",
+        "44",
+        "45",
+        "46",
+        "47",
+        "48",
+        "49",
+        "50",
+        "51",
+        "52",
+        "53",
+        "54",
+        "55",
+        "56",
+        "57",
+        "58",
+        "59",
+        "60",
+        "61",
+        "62",
+        "63",
+        "64",
+        "65",
+        "66",
+        "67",
+        "68",
+        "69",
+        "70",
+        "71",
+        "72",
+        "73",
+        "74",
+        "75",
+        "76",
+        "77",
+        "78",
+        "79",
+        "80",
+        "81",
+        "82",
+        "83",
+        "84",
+        "85",
+        "86",
+        "87",
+        "88",
+        "89",
+        "90",
+        "91",
+        "92",
+        "93",
+        "94",
+        "95",
+        "96",
+        "97",
+        "98",
+        "99",
+        "100"
+      ],
+      "WEB_OPEN__target__source": [
+        "INPUT_SPAN",
+        "STATE_REFERENCE"
+      ],
+      "WEB_OPEN__target__reference": [
+        "state.active_url"
+      ],
+      "WEB_OPEN__browser__source": [
+        "ABSENT",
+        "INPUT_SPAN",
+        "STATE_REFERENCE"
+      ],
+      "WEB_OPEN__browser__reference": [
+        "state.active_browser"
+      ],
+      "WEB_SEARCH__query__source": [
+        "INPUT_SPAN",
+        "STATE_REFERENCE"
+      ],
+      "WEB_SEARCH__query__reference": [
+        "state.active_media"
+      ],
+      "WEB_SEARCH__engine__source": [
+        "ABSENT",
+        "INPUT_SPAN"
+      ],
+      "WEB_NAVIGATE__action": [
+        "BACK",
+        "FORWARD",
+        "REFRESH",
+        "SCROLL_UP",
+        "SCROLL_DOWN",
+        "GO_HOME"
+      ],
+      "WEB_NAVIGATE__amount": [
+        "ABSENT",
+        "1",
+        "2",
+        "3",
+        "4",
+        "5",
+        "6",
+        "7",
+        "8",
+        "9",
+        "10"
+      ],
+      "TAB_CONTROL__action": [
+        "NEW",
+        "CLOSE",
+        "SWITCH",
+        "REOPEN"
+      ],
+      "TAB_CONTROL__tab_index__source": [
+        "ABSENT",
+        "INPUT_SPAN"
+      ],
+      "TAB_CONTROL__tab_reference__source": [
+        "ABSENT",
+        "INPUT_SPAN",
+        "STATE_REFERENCE"
+      ],
+      "TAB_CONTROL__tab_reference__reference": [
+        "state.active_browser"
+      ],
+      "RUN_COMMAND__command_id": [
+        "LOCK_SCREEN",
+        "SHUTDOWN_SYSTEM",
+        "RESTART_SYSTEM",
+        "SLEEP_SYSTEM",
+        "TAKE_SCREENSHOT",
+        "SET_VOLUME"
+      ],
+      "TASK_STATUS__scope": [
+        "ABSENT",
+        "LAST_TASK",
+        "ACTIVE_TASK"
+      ],
+      "SOCIAL_RESPONSE__intent": [
+        "GREETING",
+        "THANKS",
+        "GOODBYE",
+        "ACKNOWLEDGEMENT"
+      ]
+    },
+    "spans": [
+      "APPLICATION_CONTROL__application",
+      "MEDIA_CONTROL__query",
+      "WEB_OPEN__target",
+      "WEB_OPEN__browser",
+      "WEB_SEARCH__query",
+      "WEB_SEARCH__engine",
+      "TAB_CONTROL__tab_index",
+      "TAB_CONTROL__tab_reference"
+    ],
+    "references": {
+      "APPLICATION_CONTROL__application": [
+        "state.current_target_application"
+      ],
+      "MEDIA_CONTROL__query": [
+        "state.active_media"
+      ],
+      "WEB_OPEN__target": [
+        "state.active_url"
+      ],
+      "WEB_OPEN__browser": [
+        "state.active_browser"
+      ],
+      "WEB_SEARCH__query": [
+        "state.active_media"
+      ],
+      "WEB_SEARCH__engine": [],
+      "TAB_CONTROL__tab_reference": [
+        "state.active_browser"
+      ]
+    }
+  },
+  "release": {
+    "model_name": "VSAD",
+    "version": "0.0.3",
+    "status": "candidate_release_phase2_generalization",
+    "selected_checkpoint": "artifacts/vsad_phase2/checkpoints/best.pt",
+    "selected_epoch": 1,
+    "checkpoint_sha256": "0c09036d06951168a0e3924cdbef8d9fc11c75e64aae3ae95f5dc6ff67de041e",
+    "stage": "vsad_phase2",
+    "locked_test_metrics": {
+      "validation_loss": 1.8229015764923906,
+      "act_accuracy": 0.9903656126482213,
+      "goal_macro_f1": 0.9619693049890751,
+      "parameter_accuracy": 0.962817040137897,
+      "span_exact_match": 0.9521354933726067,
+      "state_reference_accuracy": 1.0,
+      "unsafe_false_execute_rate": 0.006177606177606178,
+      "response_token_accuracy": 0.8950301613475548,
+      "response_perplexity": 4.74414871246208,
+      "response_eos_rate": 1.0,
+      "response_empty_rate": 0.0,
+      "response_truncation_rate": 0.0,
+      "response_semantic_consistency": 0.8801877470355731,
+      "premature_success_claim_rate": 0.0,
+      "invalid_frame_rate": 0.0,
+      "checkpoint_epoch": 1
+    },
+    "locked_test_delta_vs_0_0_2": {
+      "validation_loss": -0.01544356693627802,
+      "act_accuracy": 0.0007411067193675569,
+      "goal_macro_f1": 0.0003643589809719794,
+      "parameter_accuracy": 0.0002462447672986201,
+      "span_exact_match": -0.0007363770250368162,
+      "state_reference_accuracy": 0.0,
+      "unsafe_false_execute_rate": -0.0007722007722007719,
+      "response_token_accuracy": 0.0022334008223924284,
+      "response_perplexity": -0.03867583241067063,
+      "response_eos_rate": 0.0,
+      "response_empty_rate": 0.0,
+      "response_truncation_rate": 0.0,
+      "response_semantic_consistency": -0.0014822134387352248,
+      "premature_success_claim_rate": 0.0,
+      "invalid_frame_rate": 0.0
+    }
+  }
+}
