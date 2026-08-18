@@ -1,4 +1,4 @@
-from UI.app import UIAction, UIConfig, UIState
+from App.Frontend.app import UIAction, UIConfig, UIState
 
 
 def test_action_timeout_returns_to_normal():
