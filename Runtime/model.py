@@ -261,7 +261,7 @@ class VSADModel:
         
         self.model = build_model(self.config).to(self.device)
         weight_path = self.model_dir / "VASD.safetensors" if (self.model_dir / "VASD.safetensors").exists() else self.model_dir / "model.safetensors"
-        load_model(self.model, str(weight_path), strict=True, device=str(self.device))
+        load_model(self.model, str(weight_path), strict=False, device=str(self.device))
         self.model.eval()
 
     def infer(self, text: str, context: Optional[Sequence[Dict[str, Any]]] = None, state: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:

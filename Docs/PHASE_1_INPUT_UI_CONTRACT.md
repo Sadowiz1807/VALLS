@@ -1,31 +1,31 @@
-# Phase 1 — Input/UI Contract
+# Phase 1 — Voice/UI Contract
 
 > **Trạng thái:** COMPLETE
-> **Phạm vi:** Các quyết định và contract của Phase 1 בלבד. Không mô tả implementation phase khác.
+> **Phạm vi:** Các quyết định và contract của Phase 1. Không mô tả implementation phase khác.
 
-## 1. Input contract
+## 1. Voice contract
 
 Pipeline của Phase 1:
 
 ```text
-Microphone → Input Module → Faster-Whisper → INPUT_FINAL.text
+Microphone → Voice Process → Faster-Whisper → VOICE_FINAL.text
 ```
 
 Event:
 
 ```text
-INPUT_STARTED
-INPUT_PARTIAL       optional, không gửi sang model
-INPUT_FINAL         text cuối cùng
-INPUT_CANCELLED
-INPUT_ERROR
+VOICE_STARTED
+VOICE_PARTIAL       optional, không gửi sang model
+VOICE_FINAL         text cuối cùng
+VOICE_CANCELLED
+VOICE_ERROR
 ```
 
-`INPUT_FINAL`:
+`VOICE_FINAL`:
 
 ```json
 {
-  "event": "INPUT_FINAL",
+  "event": "VOICE_FINAL",
   "text": "mở spotify trên web",
   "language": "vi",
   "source": "microphone",
@@ -47,7 +47,7 @@ VAD: Silero VAD
 no-speech timeout: 5 seconds
 ```
 
-Input Module sở hữu microphone stream và Faster-Whisper. Chỉ `INPUT_FINAL` được gửi tiếp. Không lưu audio.
+Voice Process sở hữu microphone stream và Faster-Whisper. Chỉ `VOICE_FINAL` được gửi tiếp. Không lưu audio.
 
 ## 3. Pygame window
 
@@ -57,35 +57,28 @@ mode: windowed
 orientation: portrait
 ratio: width:height = 6:9
 FPS: 30
-frame format: PNG sequence
-pixel format: RGBA
-alpha: enabled
-scaling: preserve_aspect_ratio
+render: màu nền + màu nhấn + decoration (pygame.draw), không dùng image frames
 ```
 
 Kích thước pixel cụ thể chưa khóa; implementation giữ đúng tỷ lệ 6:9.
 
-Window chỉ hiển thị animation. Response text do backend speech xử lý.
+UI hiển thị tên action và subtitle (transcript/model metadata) bằng text.
 
-## 4. Animation contract
+## 4. Action visual contract
+
+Mỗi action là một tổ hợp màu + decoration riêng, vẽ bằng pygame.draw, không cần file ảnh:
 
 ```text
-UI/assets/animations/
-├── normal/
-├── listening/
-├── speech/
-├── thinking/
-├── processing/
-├── executing/
-├── success/
-└── error/
+Action         Nền              Nhấn             Decoration
+normal         (10,14,20)       (60,70,90)       lưới chấm tĩnh
+listening      (8,16,30)        (0,150,255)      vòng tròn lan rộng
+speech         (6,22,18)        (0,200,100)      cột sóng âm
+thinking       (22,20,6)        (200,200,0)      chấm quỹ đạo
+processing     (26,16,6)        (255,165,0)      cung quay
+executing      (28,12,8)        (255,100,0)      cột tiến trình
+success        (6,22,10)        (0,200,0)        vòng nở + dấu tick
+error          (26,6,6)         (220,40,40)      chữ X nhấp nháy
 ```
-
-- Mỗi action có thư mục riêng.
-- Frame đặt tên `frame_0001.png`, `frame_0002.png`, ...
-- Pygame preload frame khi khởi động/reload.
-- Thiếu action/frame/config dùng fallback UI màu đỏ.
-- Worker chỉ gửi action/state; Pygame render trên UI thread.
 
 Action mapping:
 
@@ -101,6 +94,10 @@ SUCCESS           → success → normal
 ERROR             → error → normal
 ```
 
+- Decoration tính theo thời gian, không đọc file mỗi frame.
+- Worker chỉ gửi action/state; Pygame render trên UI thread.
+- Không còn phụ thuộc animation assets; lỗi không lường trước fallback về `normal`.
+
 ## 5. State và request policy
 
 - `success` hiển thị 3 giây rồi về `normal`.
@@ -114,6 +111,7 @@ ERROR             → error → normal
 
 ## 6. Model boundary
 
+- Adapter đặt trong Runtime (`Runtime/vsad_adapter.py`).
 - Lỗi model → `ERROR`.
 - Model output được validate bằng Pydantic runtime validator.
 - JSON Schema là tài liệu contract.
@@ -121,24 +119,20 @@ ERROR             → error → normal
 - Runtime vẫn giữ `request_id`.
 - Runtime lấy `model_version` từ model adapter.
 
-## 7. Logging và fallback
+## 7. Logging
 
 - Logging mặc định chỉ ghi structured status.
 - Không ghi transcript mặc định.
 - Không lưu audio.
-- Animation assets thiếu vẫn khởi động được.
-- Fallback UI là màu đỏ.
 
 ## 8. Definition of Done
 
-- [x] Input event contract.
+- [x] Voice event contract.
 - [x] Faster-Whisper settings.
 - [x] Pygame window settings.
-- [x] Animation action folders.
-- [x] Frame format and scaling.
+- [x] Action visual contract (màu + decoration).
 - [x] State timeout/cancel policy.
 - [x] Sequential request policy.
 - [x] Model error policy.
 - [x] Validator policy.
 - [x] Logging/audio policy.
-- [x] Missing-assets fallback policy.

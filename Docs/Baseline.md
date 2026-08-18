@@ -10,8 +10,8 @@
 ```text
 Microphone
   ↓
-Input Module / Faster-Whisper
-  ↓ INPUT_FINAL.text
+Voice Process / Faster-Whisper
+  ↓ VOICE_FINAL.text
 VSAD 0.0.4
   ↓ normalized metadata
 Routing
@@ -25,21 +25,21 @@ UI Pygame
 
 | Thành phần | Trách nhiệm | Không làm |
 |---|---|---|
-| Input | Thu microphone, VAD, Faster-Whisper, phát input event | Không resolve app, không gọi skill |
-| UI | Pygame window, event loop, render animation/action | Không chứa routing/business logic |
+| Voice | Thu microphone, VAD, Faster-Whisper, phát voice event | Không resolve app, không gọi skill |
+| UI | Pygame window, event loop, render action (màu + decoration) | Không chứa routing/business logic |
 | Model | Text → metadata theo VSAD 0.0.4 | Không kiểm tra executable, URL, app availability |
 | Routing | Validate metadata, resolve registry, chọn route/skill/resource | Không tự tạo capability ngoài registry |
 | Skill | Thực hiện capability được phép | Không parse ngôn ngữ tự nhiên |
 | Resource | Cung cấp executable, URL, browser hoặc system target | Không quyết định intent |
 | Result | Trạng thái và evidence grounded | Không báo thành công nếu chưa có evidence |
 
-## 3. Input và Model contract
+## 3. Voice và Model contract
 
-### Input event
+### Voice event
 
 ```json
 {
-  "event": "INPUT_FINAL",
+  "event": "VOICE_FINAL",
   "text": "mở spotify trên web",
   "language": "vi",
   "source": "microphone",
@@ -52,11 +52,11 @@ UI Pygame
 Event hỗ trợ:
 
 ```text
-INPUT_STARTED
-INPUT_PARTIAL       optional, không gửi sang model
-INPUT_FINAL         text cuối gửi sang model
-INPUT_CANCELLED
-INPUT_ERROR
+VOICE_STARTED
+VOICE_PARTIAL      optional, không gửi sang model
+VOICE_FINAL        text cuối gửi sang model
+VOICE_CANCELLED
+VOICE_ERROR
 ```
 
 ### VSAD metadata
@@ -136,18 +136,18 @@ Runtime/Registry/skills.json
 
 ## 6. Pygame UI contract
 
-Pygame là owner của window, event loop, render frame và clock.
+Pygame là owner của window, event loop, render và clock. UI không dùng image frames — mỗi action là một tổ hợp màu nền + màu nhấn + decoration vẽ bằng pygame.draw:
 
 ```text
-UI/assets/animations/
-├── normal/
-├── listening/
-├── speech/
-├── thinking/
-├── processing/
-├── executing/
-├── success/
-└── error/
+Action         Nền              Nhấn             Decoration
+normal         (10,14,20)       (60,70,90)       lưới chấm tĩnh
+listening      (8,16,30)        (0,150,255)      vòng tròn lan rộng
+speech         (6,22,18)        (0,200,100)      cột sóng âm
+thinking       (22,20,6)        (200,200,0)      chấm quỹ đạo
+processing     (26,16,6)        (255,165,0)      cung quay
+executing      (28,12,8)        (255,100,0)      cột tiến trình
+success        (6,22,10)        (0,200,0)        vòng nở + dấu tick
+error          (26,6,6)         (220,40,40)      chữ X nhấp nháy
 ```
 
 Action mapping:
@@ -164,15 +164,7 @@ SUCCESS           → success → normal
 ERROR             → error → normal
 ```
 
-Mỗi action dùng frame riêng:
-
-```text
-frame_0001.png
-frame_0002.png
-...
-```
-
-Pygame preload frame khi khởi động/reload, không đọc file mỗi frame. Thiếu frame/config dùng fallback UI màu đỏ. UI chỉ hiển thị animation; response text do backend speech xử lý.
+UI hiển thị tên action và subtitle (transcript/model metadata) bằng text. Decoration tính theo thời gian, không đọc file mỗi frame. Thiếu assets không xảy ra vì không còn phụ thuộc file ảnh; lỗi không lường trước fallback về `normal`.
 
 ## 7. Threading và request policy
 
@@ -204,20 +196,18 @@ Không lưu audio. Logging mặc định chỉ là structured status; không ghi
 
 ```text
 AL_voice_local/
-├── Application/
+├── App/
+│   ├── Frontend/
+│   │   └── app.py                     # Pygame window/event loop, color+decoration
 │   └── cli_runner.py
-├── Input/                              # microphone + transcription
-├── UI/
-│   ├── app.py                          # Pygame window/event loop
-│   ├── state.py
-│   └── assets/animations/              # action folders ở trên
-├── Model/                              # VSAD adapter boundary
+├── Voice/                              # microphone + transcription (VoiceProcess)
 ├── Routing/                            # metadata → execution plan
 ├── Skill/                              # capability implementations
 ├── Resource/                           # registry/resource checks
 ├── Runtime/
 │   ├── engine.py
 │   ├── model.py
+│   ├── vsad_adapter.py                 # VSAD adapter boundary
 │   ├── Registry/
 │   │   ├── applications.json
 │   │   ├── browsers.json
