@@ -1,24 +1,19 @@
 import sys
 from pathlib import Path
 
-# Thêm đường dẫn project
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-import torch
-from Runtime.engine import RuntimeEngine
 from Runtime.model import VSADModel
+from Runtime.engine import AgentHarness
 
 def main():
-    # 1. Setup Runtime Model
     release_dir = ROOT / "Runtime/Model/VSAD/0.0.3"
     vsad = VSADModel(release_dir)
+    harness = AgentHarness(ROOT / "Runtime/Registry")
 
-    # 2. Khởi tạo Engine
-    engine = RuntimeEngine(ROOT / "Runtime/Registry")
-
-    print("=== LOCAL VOICE ASSISTANT RUNTIME (PHASE 1 PROTOTYPE) ===")
-    print("Sẵn sàng nhận câu lệnh. Gõ 'exit' hoặc 'quit' để thoát.\n")
+    print("=== LOCAL AGENTIC VOICE ASSISTANT (MULTI-TURN & HARNESS) ===")
+    print("Sẵn sàng nhận lệnh. Gõ 'exit' để thoát.\n")
 
     while True:
         try:
@@ -28,9 +23,8 @@ def main():
             if text.lower() in ("exit", "quit"):
                 break
 
-            # Infer & Dispatch
-            frame = vsad.infer(text)
-            dispatch_res = engine.dispatch_turn(text, frame)
+            # Agentic Step: Memory -> Inference -> Tool Dispatch -> State Update
+            dispatch_res = harness.step(text, vsad)
             
             print(f"Assistant> {dispatch_res.get('response')}")
             if dispatch_res.get("status") == "EXECUTED":

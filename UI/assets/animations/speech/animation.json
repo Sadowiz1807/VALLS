@@ -1,0 +1,9 @@
+{
+  "action": "speech",
+  "fps": 30,
+  "loop": true,
+  "fallback": "normal",
+  "format": "PNG",
+  "pixel_format": "RGBA",
+  "scaling": "preserve_aspect_ratio"
+}

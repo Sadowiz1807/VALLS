@@ -2,9 +2,12 @@
   "project": {
     "name": "AI_voice_assistant",
     "task": "multi_task_semantics_and_response",
-    "initialization": "random_weights",
+    "initialization": "VSAD_0.0.3_full_model_start",
     "contract_version": "2.0",
-    "baseline": "multi_task_transformer_v2"
+    "baseline": "multi_task_transformer_v2",
+    "release_version": "0.0.4",
+    "release_stage": "vsad_phase4",
+    "release_checkpoint": "best.pt (epoch 4)"
   },
   "tokenizer": {
     "library": "tokenizers",
@@ -37,8 +40,8 @@
     "d_ff": 2048,
     "dropout": 0.1,
     "max_input_length": 256,
-    "max_response_length": 64,
-    "gradient_checkpointing": true,
+    "max_response_length": 1024,
+    "gradient_checkpointing": false,
     "tie_response_embeddings": true
   },
   "ontology": {
@@ -266,8 +269,8 @@
     }
   },
   "data": {
-    "train_path": "Data/multitask_v2_improvement_01/mixed_train_fit_16966.jsonl",
-    "validation_path": "Data/multitask_v2_improvement_01/mixed_validation_2226.jsonl",
+    "train_path": "Data/phase4_full_agentic/full_train_phase4.jsonl",
+    "validation_path": "Data/phase4_full_agentic/full_val_phase4.jsonl",
     "locked_test_path": "Data/multitask_v2/test_20.jsonl",
     "required_fields": [
       "sample_id",
@@ -281,27 +284,27 @@
       "gold_response_text",
       "response_metadata"
     ],
-    "hard_validation_path": "Data/multitask_v2_improvement_01/hard_validation_600.jsonl"
+    "hard_validation_path": "Data/multitask_v2/validation.jsonl"
   },
   "training": {
     "seed": 42,
-    "epochs": 3,
-    "early_stopping_patience": 2,
+    "epochs": 50,
+    "early_stopping_patience": 5,
     "early_stopping_min_delta": 0.001,
-    "batch_size": 3,
-    "validation_batch_size": 3,
-    "gradient_accumulation_steps": 6,
-    "learning_rate": 5e-06,
+    "batch_size": 8,
+    "validation_batch_size": 16,
+    "gradient_accumulation_steps": 2,
+    "learning_rate": 2e-05,
     "weight_decay": 0.01,
     "label_smoothing": 0.1,
     "gradient_clip_norm": 1.0,
     "precision": "fp16_mixed",
     "num_workers": 0,
-    "checkpoint_dir": "artifacts/vsad_command_policy_v2/checkpoints",
+    "checkpoint_dir": "artifacts/vsad_phase4/checkpoints",
     "checkpoint_prefix": "multi_task_transformer_v2",
     "auto_resume": true,
     "resume_from": null,
-    "log_dir": "artifacts/vsad_command_policy_v2/runs",
+    "log_dir": "artifacts/vsad_phase4/runs",
     "loss_weights": {
       "act": 1.0,
       "goal": 1.0,
@@ -313,7 +316,7 @@
     "act_accuracy": 0.95,
     "goal_macro_f1": 0.92,
     "parameter_accuracy": 0.9,
-    "unsafe_false_execute_rate": 0.005,
+    "unsafe_false_execute_rate": 0.0,
     "response_token_accuracy": 0.8,
     "response_eos_rate": 0.99,
     "response_empty_rate": 0.0,
@@ -644,50 +647,6 @@
       "TAB_CONTROL__tab_reference": [
         "state.active_browser"
       ]
-    }
-  },
-  "release": {
-    "model_name": "VSAD",
-    "version": "0.0.3",
-    "status": "candidate_release_phase2_generalization",
-    "selected_checkpoint": "artifacts/vsad_phase2/checkpoints/best.pt",
-    "selected_epoch": 1,
-    "checkpoint_sha256": "0c09036d06951168a0e3924cdbef8d9fc11c75e64aae3ae95f5dc6ff67de041e",
-    "stage": "vsad_phase2",
-    "locked_test_metrics": {
-      "validation_loss": 1.8229015764923906,
-      "act_accuracy": 0.9903656126482213,
-      "goal_macro_f1": 0.9619693049890751,
-      "parameter_accuracy": 0.962817040137897,
-      "span_exact_match": 0.9521354933726067,
-      "state_reference_accuracy": 1.0,
-      "unsafe_false_execute_rate": 0.006177606177606178,
-      "response_token_accuracy": 0.8950301613475548,
-      "response_perplexity": 4.74414871246208,
-      "response_eos_rate": 1.0,
-      "response_empty_rate": 0.0,
-      "response_truncation_rate": 0.0,
-      "response_semantic_consistency": 0.8801877470355731,
-      "premature_success_claim_rate": 0.0,
-      "invalid_frame_rate": 0.0,
-      "checkpoint_epoch": 1
-    },
-    "locked_test_delta_vs_0_0_2": {
-      "validation_loss": -0.01544356693627802,
-      "act_accuracy": 0.0007411067193675569,
-      "goal_macro_f1": 0.0003643589809719794,
-      "parameter_accuracy": 0.0002462447672986201,
-      "span_exact_match": -0.0007363770250368162,
-      "state_reference_accuracy": 0.0,
-      "unsafe_false_execute_rate": -0.0007722007722007719,
-      "response_token_accuracy": 0.0022334008223924284,
-      "response_perplexity": -0.03867583241067063,
-      "response_eos_rate": 0.0,
-      "response_empty_rate": 0.0,
-      "response_truncation_rate": 0.0,
-      "response_semantic_consistency": -0.0014822134387352248,
-      "premature_success_claim_rate": 0.0,
-      "invalid_frame_rate": 0.0
     }
   }
 }

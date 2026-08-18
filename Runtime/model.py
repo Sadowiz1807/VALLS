@@ -1,11 +1,13 @@
-"""Independent shared encoder and closed multi-task prediction heads."""
-
+"""
+VSAD Local Model & Multi-turn Context Inference Runtime.
+Hỗ trợ đưa lịch sử hội thoại (context) và trạng thái hệ thống (state) vào mô hình.
+"""
 from __future__ import annotations
 
 import json
 import math
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Dict, List, Optional, Tuple, Sequence
 
 import torch
 import torch.nn as nn
@@ -14,12 +16,12 @@ from safetensors.torch import load_model
 from tokenizers import Tokenizer
 from torch import Tensor
 
-
 # Constants
 NONE = "NONE"
 ABSENT = "ABSENT"
 INPUT_SPAN = "INPUT_SPAN"
 STATE_REFERENCE = "STATE_REFERENCE"
+
 
 class TokenEmbedding(nn.Module):
     def __init__(self, vocab_size: int, d_model: int) -> None:
@@ -36,25 +38,20 @@ class PositionalEncoding(nn.Module):
         super().__init__()
         positions = torch.arange(max_length, dtype=torch.float32).unsqueeze(1)
         frequencies = torch.exp(
-            torch.arange(0, d_model, 2, dtype=torch.float32)
-            * (-(math.log(10_000.0) / d_model))
+            torch.arange(0, d_model, 2, dtype=torch.float32) * (-(math.log(10_000.0) / d_model))
         )
         encoding = torch.zeros(max_length, d_model)
         encoding[:, 0::2] = torch.sin(positions * frequencies)
-        encoding[:, 1::2] = torch.cos(
-            positions * frequencies[: encoding[:, 1::2].shape[1]]
-        )
+        encoding[:, 1::2] = torch.cos(positions * frequencies[: encoding[:, 1::2].shape[1]])
         self.max_length = max_length
         self.dropout = nn.Dropout(dropout)
         self.register_buffer("encoding", encoding.unsqueeze(0), persistent=True)
 
     def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs):
-        # Tự động điều chỉnh kích thước buffer encoding khi max_length thay đổi
         key = prefix + "encoding"
         if key in state_dict:
             ckpt_encoding = state_dict[key]
             if ckpt_encoding.shape != self.encoding.shape:
-                # Dùng buffer đã tính toán động theo max_length mới để pass strict check
                 state_dict[key] = self.encoding.clone()
         super()._load_from_state_dict(state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs)
 
@@ -62,8 +59,7 @@ class PositionalEncoding(nn.Module):
         if hidden_states.size(1) > self.max_length:
             raise ValueError("Sequence exceeds configured maximum length")
         return self.dropout(
-            hidden_states
-            + self.encoding[:, : hidden_states.size(1)].to(dtype=hidden_states.dtype)
+            hidden_states + self.encoding[:, : hidden_states.size(1)].to(dtype=hidden_states.dtype)
         )
 
 
@@ -83,270 +79,154 @@ class LayerNormalization(nn.Module):
 class MultiHeadAttention(nn.Module):
     def __init__(self, d_model: int, heads: int, dropout: float) -> None:
         super().__init__()
-        if d_model % heads:
-            raise ValueError("d_model must be divisible by attention heads")
         self.heads = heads
-        self.head_size = d_model // heads
-        self.d_model = d_model
+        self.d_k = d_model // heads
         self.query = nn.Linear(d_model, d_model)
         self.key = nn.Linear(d_model, d_model)
         self.value = nn.Linear(d_model, d_model)
         self.output = nn.Linear(d_model, d_model)
         self.dropout = nn.Dropout(dropout)
 
-    def _split(self, tensor: Tensor) -> Tensor:
-        batch, length, _ = tensor.shape
-        return tensor.view(batch, length, self.heads, self.head_size).transpose(1, 2)
-
-    def forward(self, hidden_states: Tensor, mask: Tensor | None) -> Tensor:
-        query = self._split(self.query(hidden_states))
-        key = self._split(self.key(hidden_states))
-        value = self._split(self.value(hidden_states))
-        scores = query @ key.transpose(-2, -1) / math.sqrt(self.head_size)
+    def forward(self, q: Tensor, k: Tensor, v: Tensor, mask: Optional[Tensor] = None) -> Tensor:
+        batch_size = q.size(0)
+        q_heads = self.query(q).view(batch_size, -1, self.heads, self.d_k).transpose(1, 2)
+        k_heads = self.key(k).view(batch_size, -1, self.heads, self.d_k).transpose(1, 2)
+        v_heads = self.value(v).view(batch_size, -1, self.heads, self.d_k).transpose(1, 2)
+        scores = torch.matmul(q_heads, k_heads.transpose(-2, -1)) / math.sqrt(self.d_k)
         if mask is not None:
-            scores = scores.masked_fill(
-                ~mask.to(device=scores.device, dtype=torch.bool),
-                torch.finfo(scores.dtype).min,
-            )
-        attended = self.dropout(scores.softmax(-1)) @ value
-        attended = attended.transpose(1, 2).contiguous().view(
-            hidden_states.size(0), hidden_states.size(1), self.d_model
-        )
-        return self.output(attended)
-
-
-class CrossAttention(nn.Module):
-    """Multi-head attention from decoder queries to encoder memory."""
-
-    def __init__(self, d_model: int, heads: int, dropout: float) -> None:
-        super().__init__()
-        if d_model % heads:
-            raise ValueError("d_model must be divisible by attention heads")
-        self.heads = heads
-        self.head_size = d_model // heads
-        self.d_model = d_model
-        self.query = nn.Linear(d_model, d_model)
-        self.key = nn.Linear(d_model, d_model)
-        self.value = nn.Linear(d_model, d_model)
-        self.output = nn.Linear(d_model, d_model)
-        self.dropout = nn.Dropout(dropout)
-
-    def _split(self, tensor: Tensor) -> Tensor:
-        batch, length, _ = tensor.shape
-        return tensor.view(batch, length, self.heads, self.head_size).transpose(1, 2)
-
-    def forward(self, query_states: Tensor, memory: Tensor, memory_mask: Tensor | None) -> Tensor:
-        query = self._split(self.query(query_states))
-        key = self._split(self.key(memory))
-        value = self._split(self.value(memory))
-        scores = query @ key.transpose(-2, -1) / math.sqrt(self.head_size)
-        if memory_mask is not None:
-            scores = scores.masked_fill(
-                ~memory_mask.to(device=scores.device, dtype=torch.bool),
-                torch.finfo(scores.dtype).min,
-            )
-        attended = self.dropout(scores.softmax(-1)) @ value
-        attended = attended.transpose(1, 2).contiguous().view(
-            query_states.size(0), query_states.size(1), self.d_model
-        )
-        return self.output(attended)
+            scores = scores.masked_fill(mask == 0, float("-inf"))
+        attention = self.dropout(torch.softmax(scores, dim=-1))
+        context = torch.matmul(attention, v_heads).transpose(1, 2).contiguous()
+        return self.output(context.view(batch_size, -1, self.heads * self.d_k))
 
 
 class FeedForward(nn.Module):
     def __init__(self, d_model: int, d_ff: int, dropout: float) -> None:
         super().__init__()
         self.layers = nn.Sequential(
-            nn.Linear(d_model, d_ff), nn.GELU(), nn.Dropout(dropout), nn.Linear(d_ff, d_model)
+            nn.Linear(d_model, d_ff),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_ff, d_model),
+            nn.Dropout(dropout),
         )
 
     def forward(self, hidden_states: Tensor) -> Tensor:
         return self.layers(hidden_states)
 
 
-class Residual(nn.Module):
-    def __init__(self, d_model: int, dropout: float) -> None:
+class ResidualBlock(nn.Module):
+    def __init__(self, sublayer: nn.Module, d_model: int) -> None:
         super().__init__()
+        self.sublayer = sublayer
         self.norm = LayerNormalization(d_model)
-        self.dropout = nn.Dropout(dropout)
 
-    def forward(self, hidden_states: Tensor, layer: Callable[[Tensor], Tensor]) -> Tensor:
-        return hidden_states + self.dropout(layer(self.norm(hidden_states)))
+    def forward(self, hidden_states: Tensor, *args: Any) -> Tensor:
+        return hidden_states + self.sublayer(self.norm(hidden_states), *args)
 
 
 class EncoderBlock(nn.Module):
     def __init__(self, d_model: int, heads: int, d_ff: int, dropout: float) -> None:
         super().__init__()
         self.attention = MultiHeadAttention(d_model, heads, dropout)
+        self.attention_residual = ResidualBlock(self.attention, d_model)
         self.feed_forward = FeedForward(d_model, d_ff, dropout)
-        self.attention_residual = Residual(d_model, dropout)
-        self.feed_forward_residual = Residual(d_model, dropout)
+        self.feed_forward_residual = ResidualBlock(self.feed_forward, d_model)
 
-    def forward(self, hidden_states: Tensor, mask: Tensor | None) -> Tensor:
-        hidden_states = self.attention_residual(
-            hidden_states, lambda states: self.attention(states, mask)
-        )
-        return self.feed_forward_residual(hidden_states, self.feed_forward)
+    def forward(self, hidden_states: Tensor, mask: Optional[Tensor] = None) -> Tensor:
+        hidden_states = self.attention_residual(hidden_states, hidden_states, hidden_states, mask)
+        return self.feed_forward_residual(hidden_states)
 
 
 class Encoder(nn.Module):
-    def __init__(self, layers: nn.ModuleList, d_model: int, gradient_checkpointing: bool) -> None:
+    def __init__(self, layers: nn.ModuleList, d_model: int, gradient_checkpointing: bool = False) -> None:
         super().__init__()
         self.layers = layers
         self.norm = LayerNormalization(d_model)
-        self.gradient_checkpointing = gradient_checkpointing
 
-    def forward(self, hidden_states: Tensor, mask: Tensor | None) -> Tensor:
+    def forward(self, hidden_states: Tensor, mask: Optional[Tensor] = None) -> Tensor:
+        if mask is not None and mask.dim() == 2:
+            mask = mask.unsqueeze(1).unsqueeze(2)
         for layer in self.layers:
-            if self.training and self.gradient_checkpointing:
-                hidden_states = checkpoint(
-                    lambda states, current=layer: current(states, mask),
-                    hidden_states,
-                    use_reentrant=False,
-                )
-            else:
-                hidden_states = layer(hidden_states, mask)
+            hidden_states = layer(hidden_states, mask)
         return self.norm(hidden_states)
 
 
 class DecoderBlock(nn.Module):
-    """Pre-norm autoregressive block with causal self-attention and encoder cross-attention."""
-
     def __init__(self, d_model: int, heads: int, d_ff: int, dropout: float) -> None:
         super().__init__()
         self.self_attention = MultiHeadAttention(d_model, heads, dropout)
-        self.cross_attention = CrossAttention(d_model, heads, dropout)
+        self.self_residual = ResidualBlock(self.self_attention, d_model)
+        self.cross_attention = MultiHeadAttention(d_model, heads, dropout)
+        self.cross_residual = ResidualBlock(self.cross_attention, d_model)
         self.feed_forward = FeedForward(d_model, d_ff, dropout)
-        self.self_residual = Residual(d_model, dropout)
-        self.cross_residual = Residual(d_model, dropout)
-        self.feed_forward_residual = Residual(d_model, dropout)
+        self.feed_forward_residual = ResidualBlock(self.feed_forward, d_model)
 
-    def forward(
-        self,
-        hidden_states: Tensor,
-        memory: Tensor,
-        self_mask: Tensor,
-        memory_mask: Tensor | None,
-    ) -> Tensor:
-        hidden_states = self.self_residual(
-            hidden_states, lambda states: self.self_attention(states, self_mask)
-        )
-        hidden_states = self.cross_residual(
-            hidden_states, lambda states: self.cross_attention(states, memory, memory_mask)
-        )
-        return self.feed_forward_residual(hidden_states, self.feed_forward)
+    def forward(self, hidden_states: Tensor, memory: Tensor, self_mask: Optional[Tensor] = None, memory_mask: Optional[Tensor] = None) -> Tensor:
+        hidden_states = self.self_residual(hidden_states, hidden_states, hidden_states, self_mask)
+        hidden_states = self.cross_residual(hidden_states, memory, memory, memory_mask)
+        return self.feed_forward_residual(hidden_states)
 
 
 class Decoder(nn.Module):
-    def __init__(self, layers: nn.ModuleList, d_model: int, gradient_checkpointing: bool) -> None:
+    def __init__(self, layers: nn.ModuleList, d_model: int, gradient_checkpointing: bool = False) -> None:
         super().__init__()
         self.layers = layers
         self.norm = LayerNormalization(d_model)
-        self.gradient_checkpointing = gradient_checkpointing
 
-    @staticmethod
-    def causal_mask(response_mask: Tensor) -> Tensor:
-        length = response_mask.size(1)
-        causal = torch.ones(length, length, device=response_mask.device, dtype=torch.bool).tril()
-        return causal.view(1, 1, length, length) & response_mask[:, None, None, :].bool()
-
-    def forward(
-        self,
-        hidden_states: Tensor,
-        memory: Tensor,
-        response_mask: Tensor,
-        memory_mask: Tensor | None,
-    ) -> Tensor:
-        self_mask = self.causal_mask(response_mask)
+    def forward(self, hidden_states: Tensor, memory: Tensor, self_mask: Optional[Tensor] = None, memory_mask: Optional[Tensor] = None) -> Tensor:
+        if memory_mask is not None and memory_mask.dim() == 2:
+            memory_mask = memory_mask.unsqueeze(1).unsqueeze(2)
         for layer in self.layers:
-            if self.training and self.gradient_checkpointing:
-                hidden_states = checkpoint(
-                    lambda states, current=layer: current(states, memory, self_mask, memory_mask),
-                    hidden_states,
-                    use_reentrant=False,
-                )
-            else:
-                hidden_states = layer(hidden_states, memory, self_mask, memory_mask)
+            hidden_states = layer(hidden_states, memory, self_mask, memory_mask)
         return self.norm(hidden_states)
 
 
 class MultiTaskTransformer(nn.Module):
-    def __init__(self, config: dict[str, Any]) -> None:
+    def __init__(self, config: Dict[str, Any]) -> None:
         super().__init__()
         model = config["model"]
         d_model = model["d_model"]
+        self.config = config
         self.embedding = TokenEmbedding(config["tokenizer"]["vocab_size"], d_model)
         self.position = PositionalEncoding(d_model, model["max_input_length"], model["dropout"])
         self.encoder = Encoder(
-            nn.ModuleList(
-                EncoderBlock(d_model, model["attention_heads"], model["d_ff"], model["dropout"])
-                for _ in range(model["encoder_layers"])
-            ),
-            d_model,
-            model["gradient_checkpointing"],
+            nn.ModuleList(EncoderBlock(d_model, model["attention_heads"], model["d_ff"], model["dropout"]) for _ in range(model["encoder_layers"])),
+            d_model, model.get("gradient_checkpointing", False)
         )
-        self.response_position = PositionalEncoding(
-            d_model, model["max_response_length"], model["dropout"]
-        )
+        self.response_position = PositionalEncoding(d_model, model["max_response_length"], model["dropout"])
         self.decoder = Decoder(
-            nn.ModuleList(
-                DecoderBlock(d_model, model["attention_heads"], model["d_ff"], model["dropout"])
-                for _ in range(model["decoder_layers"])
-            ),
-            d_model,
-            model["gradient_checkpointing"],
+            nn.ModuleList(DecoderBlock(d_model, model["attention_heads"], model["d_ff"], model["dropout"]) for _ in range(model["decoder_layers"])),
+            d_model, model.get("gradient_checkpointing", False)
         )
         self.response_head = nn.Linear(d_model, config["tokenizer"]["vocab_size"], bias=False)
         if model.get("tie_response_embeddings", True):
             self.response_head.weight = self.embedding.embedding.weight
+
         self.act_head = nn.Linear(d_model, len(config["labels"]["acts"]))
         self.goal_head = nn.Linear(d_model, len(config["labels"]["goals"]))
-        self.categorical_heads = nn.ModuleDict({key: nn.Linear(d_model, len(labels)) for key, labels in config["heads"]["categorical"].items()})
-        self.span_start_heads = nn.ModuleDict({key: nn.Linear(d_model, 1) for key in config["heads"]["spans"]})
-        self.span_end_heads = nn.ModuleDict({key: nn.Linear(d_model, 1) for key in config["heads"]["spans"]})
-        self.apply(self._reset_parameters)
-        nn.init.normal_(self.embedding.embedding.weight, mean=0.0, std=d_model ** -0.5)
+        self.categorical_heads = nn.ModuleDict({k: nn.Linear(d_model, len(v)) for k, v in config["heads"]["categorical"].items()})
+        self.span_start_heads = nn.ModuleDict({k: nn.Linear(d_model, 1) for k in config["heads"]["spans"]})
+        self.span_end_heads = nn.ModuleDict({k: nn.Linear(d_model, 1) for k in config["heads"]["spans"]})
 
-    @staticmethod
-    def _reset_parameters(module: nn.Module) -> None:
-        if isinstance(module, nn.Linear):
-            nn.init.xavier_uniform_(module.weight)
-            if module.bias is not None:
-                nn.init.zeros_(module.bias)
-
-    def encode(self, input_ids: Tensor, input_mask: Tensor | None = None) -> Tensor:
+    def encode(self, input_ids: Tensor, input_mask: Tensor) -> Tensor:
         return self.encoder(self.position(self.embedding(input_ids)), input_mask)
 
-    def decode(
-        self,
-        decoder_input_ids: Tensor,
-        memory: Tensor,
-        response_mask: Tensor,
-        input_mask: Tensor | None,
-    ) -> Tensor:
-        hidden = self.response_position(self.embedding(decoder_input_ids))
-        return self.decoder(hidden, memory, response_mask, input_mask)
-
-    def forward(
-        self,
-        input_ids: Tensor,
-        input_mask: Tensor | None = None,
-        decoder_input_ids: Tensor | None = None,
-        response_mask: Tensor | None = None,
-    ) -> dict[str, Any]:
+    def forward(self, input_ids: Tensor, input_mask: Tensor, response_input_ids: Optional[Tensor] = None) -> Dict[str, Any]:
         hidden = self.encode(input_ids, input_mask)
         pooled = hidden[:, 0]
-        outputs = {
+        outputs: Dict[str, Any] = {
             "act_logits": self.act_head(pooled),
             "goal_logits": self.goal_head(pooled),
-            "categorical_logits": {key: head(pooled) for key, head in self.categorical_heads.items()},
-            "span_start_logits": {key: head(hidden).squeeze(-1) for key, head in self.span_start_heads.items()},
-            "span_end_logits": {key: head(hidden).squeeze(-1) for key, head in self.span_end_heads.items()},
+            "categorical_logits": {k: head(pooled) for k, head in self.categorical_heads.items()},
+            "span_start_logits": {k: head(hidden).squeeze(-1) for k, head in self.span_start_heads.items()},
+            "span_end_logits": {k: head(hidden).squeeze(-1) for k, head in self.span_end_heads.items()},
         }
-        if decoder_input_ids is not None:
-            if response_mask is None:
-                response_mask = torch.ones_like(decoder_input_ids, dtype=torch.bool)
-            decoded = self.decode(decoder_input_ids, hidden, response_mask, input_mask)
-            outputs["response_logits"] = self.response_head(decoded)
+        if response_input_ids is not None:
+            seq_len = response_input_ids.size(1)
+            causal_mask = torch.tril(torch.ones((seq_len, seq_len), device=input_ids.device, dtype=torch.bool)).unsqueeze(0).unsqueeze(1)
+            dec_hidden = self.decoder(self.response_position(self.embedding(response_input_ids)), hidden, causal_mask, input_mask)
+            outputs["response_logits"] = self.response_head(dec_hidden)
         return outputs
 
 
@@ -354,18 +234,25 @@ def build_model(config: dict[str, Any]) -> MultiTaskTransformer:
     return MultiTaskTransformer(config)
 
 
-# Helper serialization & decoding
-def serialize_text(text: str, special_tokens: dict[str, str]) -> str:
+def serialize_model_turn(
+    text: str,
+    context: Optional[Sequence[Dict[str, Any]]],
+    state: Optional[Dict[str, Any]],
+    special_tokens: Dict[str, str]
+) -> str:
+    ctx_json = json.dumps(context or [], ensure_ascii=False, separators=(",", ":"))
+    state_json = json.dumps(state or {}, ensure_ascii=False, separators=(",", ":"))
+    meta_json = json.dumps({"asr_noise": "CLEAN", "language_mode": "MIXED", "locale": "vi-VN"}, ensure_ascii=False, separators=(",", ":"))
     return "".join([
-        special_tokens["context_open"], "[]", special_tokens["context_close"],
-        special_tokens["state_open"], "{}", special_tokens["state_close"],
-        special_tokens["metadata_open"], '{"asr_noise":"CLEAN","language_mode":"MIXED","locale":"vi-VN"}', special_tokens["metadata_close"],
+        special_tokens["context_open"], ctx_json, special_tokens["context_close"],
+        special_tokens["state_open"], state_json, special_tokens["state_close"],
+        special_tokens["metadata_open"], meta_json, special_tokens["metadata_close"],
         special_tokens["input_open"], text, special_tokens["input_close"],
     ])
 
 
 class VSADModel:
-    def __init__(self, model_dir: Path | str, device: torch.device | None = None):
+    def __init__(self, model_dir: Path | str, device: Optional[torch.device] = None):
         self.model_dir = Path(model_dir)
         self.config = json.loads((self.model_dir / "config.json").read_text(encoding="utf-8"))
         self.config["model"]["max_response_length"] = 1024
@@ -377,9 +264,9 @@ class VSADModel:
         load_model(self.model, str(weight_path), strict=True, device=str(self.device))
         self.model.eval()
 
-    def infer(self, text: str) -> dict[str, Any]:
+    def infer(self, text: str, context: Optional[Sequence[Dict[str, Any]]] = None, state: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         special_tokens = self.config["tokenizer"]["special_tokens"]
-        serialized = serialize_text(text, special_tokens)
+        serialized = serialize_model_turn(text, context, state, special_tokens)
         encoding = self.tokenizer.encode(serialized)
         
         input_ids = torch.tensor([encoding.ids], dtype=torch.long, device=self.device)
@@ -394,7 +281,7 @@ class VSADModel:
             act = self.config["labels"]["acts"][act_idx]
             goal = self.config["labels"]["goals"][goal_idx]
             
-            params: dict[str, Any] = {}
+            params: Dict[str, Any] = {}
             if goal != NONE and goal in self.config["ontology"]["goal_parameters"]:
                 spec = self.config["ontology"]["goal_parameters"][goal]["properties"]
                 for name, p_spec in spec.items():
