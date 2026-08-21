@@ -11,11 +11,16 @@ import difflib
 import json
 import re
 import shutil
+import subprocess
 import unicodedata
+import webbrowser
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Sequence
+
+from Runtime.Resources import Application, Browser, Media
+from Runtime.Skills import ApplicationControl, MediaControl, WebControl
 
 def normalize_text(text: str) -> str:
     if not text:
@@ -88,7 +93,8 @@ class ApplicationRegistry:
         for app in self.apps:
             if not app.get("enabled", True):
                 continue
-            if q == normalize_text(app["app_id"]) or q == normalize_text(app["name"]):
+            entity_id = app.get("app_id") or app.get("browser_id", "")
+            if q == normalize_text(entity_id) or q == normalize_text(app.get("name", entity_id)):
                 return app, 1.0
 
         for app in self.apps:
@@ -106,8 +112,13 @@ class ApplicationRegistry:
             all_names = [app["app_id"], app["name"]] + app.get("aliases", [])
             for name in all_names:
                 norm_name = normalize_text(name)
-                if q in norm_name or norm_name in q:
-                    score = min(len(q), len(norm_name)) / max(len(q), len(norm_name)) * 0.95
+                if re.search(rf"(?<!\w){re.escape(norm_name)}(?!\w)", q):
+                    score = 0.95
+                    if score > best_score:
+                        best_score = score
+                        best_app = app
+                elif q in norm_name:
+                    score = len(q) / len(norm_name) * 0.95
                     if score > best_score:
                         best_score = score
                         best_app = app
@@ -123,14 +134,32 @@ class ApplicationRegistry:
 
 class AgentHarness:
     """Agentic Execution Harness quản lý vòng lặp xử lý, memory và tool dispatching."""
-    def __init__(self, registry_dir: Path):
+    def __init__(self, registry_dir: Path, execute: bool = False, runner: Any = None, web_opener: Any = None):
+        self.registry_dir = registry_dir
         self.app_registry = ApplicationRegistry(registry_dir / "applications.json")
+        self.browser_registry = ApplicationRegistry(registry_dir / "browsers.json")
         self.skills_path = registry_dir / "skills.json"
         self.skills: List[Dict[str, Any]] = []
         if self.skills_path.exists():
             self.skills = json.loads(self.skills_path.read_text(encoding="utf-8"))
         self.pending_frame: Optional[PendingFrame] = None
         self.memory = DialogueMemory()
+        self.execute = execute
+        self.runner = runner or subprocess.Popen
+        self.web_opener = web_opener or webbrowser.open
+        application = Application(registry_dir / "applications.json", runner=self.runner)
+        web = Browser(registry_dir / "browsers.json", opener=self.web_opener, runner=self.runner)
+        media = Media(registry_dir / "media_providers.json")
+        application_skill = ApplicationControl(application)
+        web_skill = WebControl(web)
+        media_skill = MediaControl(media)
+        self.skill_handlers = {
+            "application.open": lambda args: application_skill.open(args.get("application", ""), self.execute),
+            "application.close": lambda args: application_skill.close(args.get("application", ""), self.execute),
+            "web.open": lambda args: web_skill.open(args.get("url", ""), args.get("browser"), self.execute),
+            "media.play": lambda args: media_skill.play(args.get("query", ""), args.get("platform", "spotify"), self.execute),
+            "media.transport": lambda args: media_skill.transport(args.get("action", ""), args.get("platform", "spotify"), self.execute),
+        }
 
     def step(self, raw_input: str, vsad_model: Any) -> Dict[str, Any]:
         """Thực hiện một bước agentic: nạp context -> infer model -> dispatch tool -> update state & memory."""
@@ -171,7 +200,8 @@ class AgentHarness:
             self.pending_frame = None
             exec_result = self._execute_skill(target_frame.skill_id, target_frame.arguments)
             return {
-                "status": "EXECUTED", "skill_id": target_frame.skill_id, "result": exec_result,
+                "status": "EXECUTED" if exec_result["ok"] else "ERROR",
+                "skill_id": target_frame.skill_id, "result": exec_result,
                 "response": f"Đã xác nhận và thực thi: {target_frame.description}." if exec_result["ok"] else f"Thực thi thất bại: {exec_result.get('error')}"
             }
 
@@ -212,23 +242,33 @@ class AgentHarness:
         return {"status": "INVALID_FRAME", "response": "Không thể xử lý định dạng yêu cầu."}
 
     def _handle_execute(self, raw_input: str, goal: Optional[str], params: Dict[str, Any]) -> Dict[str, Any]:
-        if goal == "APPLICATION_CONTROL":
+        if goal in ("APPLICATION_CONTROL", "WEB_OPEN"):
             action = params.get("action", "OPEN")
-            raw_app = params.get("application", "")
+            raw_app = params.get("target" if goal == "WEB_OPEN" else "application", "")
             if isinstance(raw_app, dict):
                 raw_app = raw_app.get("value", "")
-            search_query = raw_app if raw_app else raw_input
-            resolved_app, score = self.app_registry.resolve(search_query)
+            resolved_app, score = self.app_registry.resolve(raw_app)
+            if not resolved_app:
+                resolved_app, score = self.app_registry.resolve(raw_input)
 
             if not resolved_app:
                 return {"status": "UNSUPPORTED", "reason": "APP_NOT_FOUND", "response": f"Không tìm thấy ứng dụng '{raw_app or raw_input}' trong hệ thống."}
 
-            if action != "OPEN":
+            if action not in {"OPEN", "CLOSE"}:
                 return {"status": "UNSUPPORTED", "reason": "ACTION_NOT_SUPPORTED", "response": f"Chưa hỗ trợ tác vụ {action} với ứng dụng."}
+
+            if action == "CLOSE":
+                self.pending_frame = PendingFrame(
+                    skill_id="application.close", arguments={"application": resolved_app["app_id"]}, risk="MEDIUM",
+                    created_at=datetime.now(), expires_at=datetime.now() + timedelta(seconds=60),
+                    description=f"đóng {resolved_app['name']}",
+                )
+                return {"status": "AWAITING_CONFIRMATION", "skill_id": "application.close", "risk": "MEDIUM",
+                        "response": f"Bạn có chắc chắn muốn đóng {resolved_app['name']} không?"}
 
             local_executable = self.app_registry._local_executable(resolved_app)
             web_url = self.app_registry._web_url(resolved_app)
-            explicit_web = params.get("route") == "WEB" or params.get("browser")
+            explicit_web = goal == "WEB_OPEN" or params.get("route") == "WEB" or params.get("browser")
             local_available = bool(local_executable and shutil.which(local_executable))
             if explicit_web:
                 route, reason = ("WEB", "WEB_REQUESTED") if web_url else ("UNSUPPORTED", "NO_CAPABILITY")
@@ -239,16 +279,25 @@ class AgentHarness:
             else:
                 route, reason = "UNSUPPORTED", "NO_CAPABILITY"
 
-            result = None
             if route == "UNSUPPORTED":
                 return {"status": "UNSUPPORTED", "reason": reason, "resolved": resolved_app,
                         "response": f"Không có capability phù hợp cho {resolved_app['name']}."}
             self.memory.update_state("current_target_application", resolved_app["app_id"])
-            return {"status": "ROUTED", "route": route, "reason": reason,
+            if route == "LOCAL":
+                result = self._execute_skill("application.open", {"application": resolved_app["app_id"]})
+                status = "EXECUTED" if result["ok"] else ("ROUTED" if result.get("error") == "EXECUTION_DISABLED" else "ERROR")
+                return {"status": status, "route": route, "reason": reason,
+                        "app_id": resolved_app["app_id"], "app_name": resolved_app["name"],
+                        "score": score, "local_executable": local_executable, "web_url": web_url,
+                        "browser": params.get("browser"), "result": result,
+                        "response": "Đã mở ứng dụng." if result["ok"] else f"Không thể mở ứng dụng: {result.get('error')}."}
+            result = self._execute_skill("web.open", {"url": web_url, "browser": params.get("browser")})
+            status = "EXECUTED" if result["ok"] else ("ROUTED" if result.get("error") == "EXECUTION_DISABLED" else "ERROR")
+            return {"status": status, "route": route, "reason": reason,
                     "app_id": resolved_app["app_id"], "app_name": resolved_app["name"],
-                    "score": score, "local_executable": local_executable,
-                    "web_url": web_url, "browser": params.get("browser"), "result": result,
-                    "response": f"Đã chọn route {route} cho {resolved_app['name']}."}
+                    "score": score, "local_executable": local_executable, "web_url": web_url,
+                    "browser": params.get("browser"), "result": result,
+                    "response": "Đã mở trang web." if result["ok"] else f"Không thể mở trang web: {result.get('error')}."}
 
         if goal == "MEDIA_CONTROL":
             action = params.get("action", "PLAY")
@@ -259,7 +308,9 @@ class AgentHarness:
             exec_result = self._execute_skill(skill_id, {"action": action, "query": raw_query, "platform": params.get("platform", "DEFAULT")})
             if raw_query:
                 self.memory.update_state("active_media", raw_query)
-            return {"status": "EXECUTED", "skill_id": skill_id, "result": exec_result, "response": f"Đang thực hiện phát phương tiện: {raw_query or action}."}
+            status = "EXECUTED" if exec_result["ok"] else ("ROUTED" if exec_result.get("error") == "EXECUTION_DISABLED" else "ERROR")
+            return {"status": status, "skill_id": skill_id, "result": exec_result,
+                    "response": f"Đã thực hiện media: {raw_query or action}." if exec_result["ok"] else f"Không thể thực hiện media: {exec_result.get('error')}."}
 
         if goal == "RUN_COMMAND":
             cmd_id = params.get("command_id")
@@ -276,8 +327,44 @@ class AgentHarness:
 
         return {"status": "UNSUPPORTED", "response": f"Chưa hỗ trợ tác vụ {goal}."}
 
+    def _dispatch_route(self, route: str, app: Dict[str, Any], browser: Optional[str]) -> Dict[str, Any]:
+        target = self.app_registry._local_executable(app) if route == "LOCAL" else self.app_registry._web_url(app)
+        result = {"route": route, "target": target, "started": False, "error": None}
+        if not self.execute:
+            return {**result, "dry_run": True}
+        try:
+            if route == "LOCAL":
+                self.runner([target])
+            elif browser:
+                resolved, _ = self.browser_registry.resolve(browser)
+                executable = self.browser_registry._local_executable(resolved or {})
+                executable = shutil.which(executable) if executable else None
+                if not executable:
+                    raise RuntimeError("BROWSER_NOT_FOUND")
+                self.runner([executable, target])
+            elif not self.web_opener(target):
+                raise RuntimeError("WEB_OPEN_FAILED")
+            result["started"] = True
+        except (OSError, RuntimeError) as exc:
+            result["error"] = str(exc)
+        return result
+
+    @staticmethod
+    def _dispatch_response(app_name: str, result: Dict[str, Any]) -> str:
+        if result["started"]:
+            return f"Đã mở {app_name}."
+        if result["error"]:
+            return f"Không thể mở {app_name}: {result['error']}."
+        return f"Dry-run: sẵn sàng mở {app_name} qua {result['route']}."
+
     def _execute_skill(self, skill_id: str, args: Dict[str, Any]) -> Dict[str, Any]:
-        return {"ok": True, "executed_at": datetime.now().isoformat(), "skill_id": skill_id, "args": args}
+        enabled = any(item.get("skill_id") == skill_id and item.get("enabled", True) for item in self.skills)
+        if not enabled:
+            return {"ok": False, "skill_id": skill_id, "error": "SKILL_NOT_FOUND"}
+        handler = self.skill_handlers.get(skill_id)
+        if not handler:
+            return {"ok": False, "skill_id": skill_id, "error": "SKILL_NOT_IMPLEMENTED"}
+        return handler(args)
 
 
 # Alias for backward compatibility

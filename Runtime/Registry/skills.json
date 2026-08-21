@@ -3,14 +3,22 @@
     "skill_id": "application.open",
     "description": "Resolve và mở ứng dụng local",
     "accepts": {
-      "act": ["EXECUTE"],
+      "act": [
+        "EXECUTE"
+      ],
       "goal": "APPLICATION_CONTROL",
       "action": "OPEN"
     },
     "inputs": {
-      "application": {"type": "string", "required": true}
+      "application": {
+        "type": "string",
+        "required": true
+      }
     },
-    "resources": ["application.catalog.resolve", "application.control.open"],
+    "resources": [
+      "application.catalog.resolve",
+      "application.control.open"
+    ],
     "risk": "LOW",
     "confirmation_required": false
   },
@@ -18,63 +26,173 @@
     "skill_id": "application.close",
     "description": "Resolve và đóng ứng dụng local",
     "accepts": {
-      "act": ["EXECUTE"],
+      "act": [
+        "EXECUTE"
+      ],
       "goal": "APPLICATION_CONTROL",
       "action": "CLOSE"
     },
     "inputs": {
-      "application": {"type": "string", "required": true}
+      "application": {
+        "type": "string",
+        "required": true
+      }
     },
-    "resources": ["application.catalog.resolve", "application.control.close"],
+    "resources": [
+      "application.catalog.resolve",
+      "application.control.close"
+    ],
     "risk": "MEDIUM",
-    "confirmation_required": false
+    "confirmation_required": true
+  },
+  {
+    "skill_id": "web.open",
+    "description": "Mở URL bằng browser whitelist",
+    "accepts": {
+      "act": [
+        "EXECUTE"
+      ],
+      "goal": "WEB_OPEN"
+    },
+    "inputs": {
+      "url": {
+        "type": "string",
+        "required": true
+      },
+      "browser": {
+        "type": "string",
+        "required": false
+      }
+    },
+    "resources": [
+      "browser.navigation.open"
+    ],
+    "risk": "LOW",
+    "confirmation_required": false,
+    "enabled": true
   },
   {
     "skill_id": "media.play",
     "description": "Phát nội dung media",
     "accepts": {
-      "act": ["EXECUTE"],
+      "act": [
+        "EXECUTE"
+      ],
       "goal": "MEDIA_CONTROL",
       "action": "PLAY"
     },
     "inputs": {
-      "query": {"type": "string", "required": false},
-      "platform": {"type": "string", "required": false}
+      "query": {
+        "type": "string",
+        "required": false
+      },
+      "platform": {
+        "type": "string",
+        "required": false
+      }
     },
-    "resources": ["media.playback.play"],
+    "resources": [
+      "media.playback.play"
+    ],
     "risk": "LOW",
     "confirmation_required": false
+  },
+  {
+    "skill_id": "media.transport",
+    "description": "Điều khiển playback media",
+    "accepts": {
+      "act": [
+        "EXECUTE"
+      ],
+      "goal": "MEDIA_CONTROL",
+      "action": [
+        "PAUSE",
+        "RESUME",
+        "STOP",
+        "NEXT",
+        "PREVIOUS"
+      ]
+    },
+    "inputs": {
+      "action": {
+        "type": "string",
+        "required": true
+      },
+      "platform": {
+        "type": "string",
+        "required": false
+      }
+    },
+    "resources": [
+      "media.playback.pause",
+      "media.playback.resume",
+      "media.playback.stop",
+      "media.playback.next",
+      "media.playback.previous"
+    ],
+    "risk": "LOW",
+    "confirmation_required": false,
+    "enabled": true
   },
   {
     "skill_id": "system.command",
     "description": "Thực thi lệnh hệ thống",
     "accepts": {
-      "act": ["EXECUTE"],
+      "act": [
+        "EXECUTE"
+      ],
       "goal": "RUN_COMMAND"
     },
     "inputs": {
-      "command_id": {"type": "string", "required": true}
+      "command_id": {
+        "type": "string",
+        "required": true
+      }
     },
-    "resources": ["system.command.execute"],
+    "resources": [
+      "system.command.execute"
+    ],
     "risk_by_command": {
-      "SHUTDOWN_SYSTEM": {"risk": "HIGH", "confirmation_required": true},
-      "RESTART_SYSTEM": {"risk": "HIGH", "confirmation_required": true},
-      "SLEEP_SYSTEM": {"risk": "LOW", "confirmation_required": false},
-      "LOCK_SCREEN": {"risk": "LOW", "confirmation_required": false},
-      "TAKE_SCREENSHOT": {"risk": "LOW", "confirmation_required": false}
+      "SHUTDOWN_SYSTEM": {
+        "risk": "HIGH",
+        "confirmation_required": true
+      },
+      "RESTART_SYSTEM": {
+        "risk": "HIGH",
+        "confirmation_required": true
+      },
+      "SLEEP_SYSTEM": {
+        "risk": "LOW",
+        "confirmation_required": false
+      },
+      "LOCK_SCREEN": {
+        "risk": "LOW",
+        "confirmation_required": false
+      },
+      "TAKE_SCREENSHOT": {
+        "risk": "LOW",
+        "confirmation_required": false
+      }
     }
   },
   {
     "skill_id": "conversation.social",
     "description": "Phản hồi xã hội (chào hỏi, cảm ơn)",
     "accepts": {
-      "act": ["RESPOND"],
+      "act": [
+        "RESPOND"
+      ],
       "goal": "SOCIAL_RESPONSE"
     },
     "inputs": {
-      "intent": {"type": "string", "required": true}
+      "intent": {
+        "type": "string",
+        "required": true
+      }
     },
-    "resources": ["response.renderer.social"],
+    "resources": [
+      "response.renderer.social"
+    ],
     "risk": "NONE",
     "confirmation_required": false
   }

@@ -10,7 +10,7 @@
 ```text
 Microphone
   ↓
-Voice Process / Faster-Whisper
+Voice Process / NVIDIA Parakeet CTC 0.6B Vietnamese
   ↓ VOICE_FINAL.text
 VSAD 0.0.4
   ↓ normalized metadata
@@ -25,12 +25,14 @@ UI Pygame
 
 | Thành phần | Trách nhiệm | Không làm |
 |---|---|---|
-| Voice | Thu microphone, VAD, Faster-Whisper, phát voice event | Không resolve app, không gọi skill |
+| Voice | Thu microphone, lọc no-speech theo RMS, NVIDIA Parakeet ASR, phát voice event | Không resolve app, không gọi skill |
 | UI | Pygame window, event loop, render action (màu + decoration) | Không chứa routing/business logic |
 | Model | Text → metadata theo VSAD 0.0.4 | Không kiểm tra executable, URL, app availability |
 | Routing | Validate metadata, resolve registry, chọn route/skill/resource | Không tự tạo capability ngoài registry |
-| Skill | Thực hiện capability được phép | Không parse ngôn ngữ tự nhiên |
-| Resource | Cung cấp executable, URL, browser hoặc system target | Không quyết định intent |
+| Skill docs | Mô tả family/workflow, usage, keywords tham khảo, resources và điều cấm | Không cấp quyền capability, không phải runtime config |
+| Runtime Skill | Điều phối workflow trong giới hạn registry | Không parse ngôn ngữ tự nhiên, không gọi system/provider trực tiếp |
+| Runtime Resource | Thực thi operation nguyên tử với target đã resolve | Không quyết định intent, không mở rộng whitelist |
+| Registry | Config/whitelist authority cho app, browser, provider, skill và resource | Không chứa workflow implementation |
 | Result | Trạng thái và evidence grounded | Không báo thành công nếu chưa có evidence |
 
 ## 3. Voice và Model contract
@@ -132,7 +134,9 @@ Runtime/Registry/browsers.json
 Runtime/Registry/skills.json
 ```
 
-`applications.json` chứa app/service. `browsers.json` chứa browser. Đây là config tĩnh; một request không tạo hoặc ghi file mới.
+`applications.json` chứa app/service. `browsers.json` chứa browser. `skills.json` chứa skill config machine-readable. Registry là whitelist/config authority: entry thiếu hoặc `enabled=false` là `UNSUPPORTED`; skill docs/code không được tự thêm capability. Một request có thể hỏi user có muốn thêm capability chưa hỗ trợ, nhưng không tự ghi registry hoặc dispatch.
+
+Registry hiện tại cho phép Chrome, Cốc Cốc và Edge; Firefox chưa được hỗ trợ.
 
 ## 6. Pygame UI contract
 
@@ -169,7 +173,7 @@ UI hiển thị tên action và subtitle (transcript/model metadata) bằng text
 ## 7. Threading và request policy
 
 - Pygame chạy trên UI thread.
-- Microphone, Faster-Whisper, model, routing và skill không chạy trên UI thread.
+- Microphone, Parakeet, model, routing và skill không chạy trên UI thread.
 - Worker chỉ gửi event/state cho UI, không gọi Pygame trực tiếp.
 - Xử lý tuần tự, không chạy nhiều skill song song.
 - Queue tối đa 1 request đang chờ.
@@ -201,13 +205,14 @@ AL_voice_local/
 │   │   └── app.py                     # Pygame window/event loop, color+decoration
 │   └── cli_runner.py
 ├── Voice/                              # microphone + transcription (VoiceProcess)
-├── Routing/                            # metadata → execution plan
-├── Skill/                              # capability implementations
-├── Resource/                           # registry/resource checks
+├── Skills/                             # human-readable skill family docs
+│   └── <Family>/Skill.md
 ├── Runtime/
 │   ├── engine.py
 │   ├── model.py
 │   ├── vsad_adapter.py                 # VSAD adapter boundary
+│   ├── Skills/                         # workflow implementation classes
+│   ├── Resources/                      # atomic system/provider operations
 │   ├── Registry/
 │   │   ├── applications.json
 │   │   ├── browsers.json
@@ -230,9 +235,9 @@ Chỉ tạo module khi bắt đầu dùng; ưu tiên reuse `Runtime/engine.py` v
 
 ```text
 pygame
-faster-whisper
+nemo_toolkit[asr] 2.6
 sounddevice
-Silero VAD
+numpy
 Pydantic
 ```
 

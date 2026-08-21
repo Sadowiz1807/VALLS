@@ -40,6 +40,37 @@ flowchart LR
 | Resource | Runtime có thể gọi operation nguyên tử nào? | `application.catalog.resolve`, `window.control.focus` |
 | Skill | Cần phối hợp các resource theo workflow nào? | `application.open` |
 
+### 2.1. Cấu trúc source và ownership
+
+```text
+Skills/<Family>/Skill.md          # human-readable contract
+Runtime/Registry/*.json           # whitelist/config authority
+Runtime/Skills/<Family>.py        # workflow implementation
+Runtime/Resources/<Domain>.py     # atomic operations
+```
+
+- `Skill.md` mô tả family, trường hợp dùng, keywords tham khảo, workflow IDs, resources, risk và điều cấm.
+- Registry là source of truth mà runtime đọc để quyết định app, browser, provider, alias, resource, `enabled` và config được phép.
+- Runtime không parse `Skill.md` để cấp quyền. Khi tài liệu và registry khác nhau, registry thắng và tài liệu phải được đồng bộ.
+- Một Python class có thể chứa nhiều workflow methods theo cùng domain; mỗi method vẫn map tới một `skill_id` riêng.
+- Mỗi resource method vẫn map tới một public `resource_id` nguyên tử.
+
+Ví dụ:
+
+```text
+Runtime/Skills/WebControl.py
+class WebControl
+  open()       → web.open
+  change_tab() → tab.manage
+
+Runtime/Resources/Browser.py
+class Browser
+  open()       → browser.navigation.open
+  switch_tab() → browser.tabs.switch
+```
+
+Tên class/file là implementation detail PascalCase; public ID vẫn dùng lowercase dot notation.
+
 ## 3. Ranh giới Model và Runtime
 
 ### 3.1. Model trả semantic frame
@@ -103,6 +134,17 @@ Resource rule:
 3. Resource không tự gọi resource khác để tạo workflow ẩn.
 4. Availability và risk được công bố trong registry.
 5. Adapter không nhận raw shell từ model/user.
+6. Resource không tự thêm capability hoặc target ngoài Registry.
+
+### 4.1. Registry whitelist policy
+
+- Entry không tồn tại hoặc `enabled=false` nghĩa là `UNSUPPORTED`.
+- Skill chỉ được gọi resource/app/browser/provider đang được registry cho phép.
+- Không silently fallback sang browser/provider khác khi user chỉ định target chưa hỗ trợ.
+- Runtime được hỏi user có muốn thêm capability vào whitelist, nhưng không được tự ghi registry hoặc dispatch trong cùng bước.
+- Keywords trong `Skill.md` chỉ giúp người đọc hiểu trigger; aliases operational nằm trong registry.
+
+Theo registry hiện tại, browser được phép là Chrome, Cốc Cốc và Edge. Firefox chưa được whitelist nên yêu cầu như “mở YouTube bằng Firefox” phải trả `UNSUPPORTED` và hỏi user có muốn thêm Firefox vào whitelist hay không.
 
 ## 5. Resource manifest
 
@@ -215,6 +257,7 @@ Tên skill:
 - mô tả workflow, không mô tả class/module/path;
 - không đổi nghĩa trong cùng major contract;
 - skill bị bỏ dùng chuyển `enabled=false`, không tái sử dụng ID.
+- không bắt buộc trùng tên Python class/method; class chỉ là implementation container theo domain.
 
 ### 7.3. Workflow steps
 
@@ -428,3 +471,4 @@ Skill được phép enable khi:
 - response không tuyên bố success trước result;
 - end-to-end test chạy được offline nếu skill được định nghĩa là local;
 - không chứa raw shell hoặc secret trong manifest.
+- mọi target/capability được Registry whitelist; docs hoặc code không tự mở rộng danh sách.
