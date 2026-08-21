@@ -53,10 +53,11 @@ AL_voice_local/
 ├── Runtime/
 │   ├── Model/
 │   │   └── VSAD/<version>/       # Package model dùng cho inference
-│   ├── Registry/                 # Resource và skill manifests
-│   ├── Skills/                   # Workflow definitions
-│   └── Adapters/                 # Resource executors
-└── Application/                  # UI, orchestration và integration
+│   ├── Registry/                 # Whitelist/config authority
+│   ├── Skills/                   # Workflow implementation classes
+│   └── Resources/                # Atomic system/provider operations
+├── Skills/                       # Human-readable family docs: <Family>/Skill.md
+└── App/                          # UI, orchestration và integration
 ```
 
 Workspace huấn luyện/đánh giá model là một project độc lập. Application chỉ phụ thuộc package inference đã phát hành, không phụ thuộc notebook, dataset hoặc training checkpoint.
@@ -78,8 +79,10 @@ requirements.txt
 | `GOAL` | Nhóm mục tiêu semantic ổn định | Model |
 | `parameters` | Tham số typed hoặc raw input span | Model; runtime validate/resolve |
 | `response_text` | Phản hồi ứng viên do model sinh | Model |
-| Resource | Operation nguyên tử application có thể cung cấp và runtime gọi trực tiếp | Runtime registry |
+| Registry | Whitelist/config machine-readable quyết định capability được phép | Runtime registry |
+| Resource | Operation nguyên tử application có thể cung cấp và runtime gọi trực tiếp | Runtime resource layer |
 | Skill | Workflow dùng resource để hoàn thành mục tiêu | Runtime skill engine |
+| Skill.md | Tài liệu human-readable của skill family | Project docs; không phải runtime authority |
 | Adapter | Implementation local của resource contract | Runtime |
 | Executor result | Kết quả quan sát được sau execution | Runtime |
 
@@ -208,6 +211,8 @@ Quy tắc:
 - Model không quyết định resource có tồn tại.
 - Adapter chỉ nhận arguments đã validate.
 - Resource không chứa workflow nghiệp vụ nhiều bước.
+- Registry là whitelist/config authority: missing hoặc disabled capability phải fail closed.
+- Resource/skill implementation không được tự thêm app, browser, provider hoặc capability ngoài registry.
 
 ## 8. Skill contract
 
@@ -247,6 +252,8 @@ Ví dụ:
 
 Skill resolver có thể dùng exact alias, normalized token matching, fuzzy matching và optional local embeddings. Không bắt buộc Internet.
 
+Python implementation được nhóm theo family (`ApplicationControl`, `WebControl`, `MediaControl`). Một class có thể chứa nhiều workflow methods, nhưng public `skill_id` vẫn độc lập và không phụ thuộc tên class/method. `Skills/<Family>/Skill.md` chỉ mô tả; aliases/capability operational nằm trong Registry.
+
 ## 9. Safety policy
 
 ### 9.1. Dispatch gate
@@ -261,8 +268,11 @@ Runtime chỉ dispatch khi:
 6. mọi resource enabled;
 7. arguments đúng type và allowlist;
 8. risk policy đã được thỏa mãn.
+9. target/capability tồn tại và enabled trong Registry whitelist.
 
 Mọi lỗi tại trust boundary phải fail closed.
+
+Nếu user yêu cầu capability chưa whitelist, runtime trả `UNSUPPORTED` và có thể hỏi user có muốn thêm capability đó. Runtime không tự sửa Registry, không fallback sang target khác và không dispatch trong lượt đó.
 
 ### 9.2. System command policy
 

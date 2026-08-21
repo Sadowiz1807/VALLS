@@ -6,7 +6,6 @@ from typing import Optional
 
 import numpy as np
 
-
 class MicrophoneCapture:
     def __init__(self, sample_rate: int = 16000, channels: int = 1):
         self.sample_rate = sample_rate

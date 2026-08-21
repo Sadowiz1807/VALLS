@@ -1,0 +1,39 @@
+[
+  {
+    "app_id": "chrome",
+    "name": "Google Chrome",
+    "aliases": [
+      "chrome",
+      "google chrome"
+    ],
+    "enabled": true,
+    "local": {
+      "executable": "chrome.exe"
+    }
+  },
+  {
+    "app_id": "coccoc",
+    "name": "Cốc Cốc",
+    "aliases": [
+      "cốc cốc",
+      "coc coc",
+      "coccoc"
+    ],
+    "enabled": true,
+    "local": {
+      "executable": "browser.exe"
+    }
+  },
+  {
+    "app_id": "edge",
+    "name": "Microsoft Edge",
+    "aliases": [
+      "edge",
+      "microsoft edge"
+    ],
+    "enabled": true,
+    "local": {
+      "executable": "msedge.exe"
+    }
+  }
+]

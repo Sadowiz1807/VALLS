@@ -88,6 +88,9 @@ sequenceDiagram
 | `FR-RES-006` | Adapter MUST chỉ nhận validated arguments | Không nhận raw model envelope hoặc raw user shell |
 | `FR-RES-007` | Resource result MUST dùng contract chung | Có `ok`, resource ID, resolved data và error |
 | `FR-RES-008` | Thêm resource/app MUST không bắt buộc retrain model | Registry/adapter addition không đổi VSAD contract |
+| `FR-RES-009` | Registry MUST là whitelist/config authority cho capability | Missing hoặc `enabled=false` trả `UNSUPPORTED` |
+| `FR-RES-010` | Skill/resource code MUST không tự mở rộng whitelist | Không tự thêm app/browser/provider ngoài registry |
+| `FR-RES-011` | Capability chưa hỗ trợ MAY tạo câu hỏi opt-in | Hỏi có muốn thêm whitelist; không ghi registry hoặc dispatch tự động |
 
 Resource result mẫu:
 
@@ -114,6 +117,9 @@ Resource result mẫu:
 | `FR-SKL-008` | Skill MUST map result sang response phase phù hợp | Pre/success/failure được phân biệt |
 | `FR-SKL-009` | Thêm skill dùng resource hiện có MUST không bắt buộc retrain model | Registry load và routing test đủ |
 | `FR-SKL-010` | Skill ID MUST không chứa implementation detail | Không dùng path/module/class làm public ID |
+| `FR-SKL-011` | Skill implementation MAY nhóm nhiều workflow cùng domain trong một class | Mỗi method map tới `skill_id` độc lập |
+| `FR-SKL-012` | `Skills/<Family>/Skill.md` MUST chỉ là human-readable contract | Runtime không parse Markdown để cấp capability |
+| `FR-SKL-013` | Skill MUST tuân capability whitelist từ Registry | Keyword/docs không override missing/disabled entry |
 
 ## 8. Yêu cầu skill resolution
 
@@ -127,6 +133,8 @@ Resource result mẫu:
 | `FR-RTE-006` | Candidate mơ hồ MUST dẫn tới clarification | Top score thấp hoặc margin thấp không dispatch |
 | `FR-RTE-007` | Không có candidate MUST dẫn tới unsupported | Không fallback raw shell hoặc resource ngẫu nhiên |
 | `FR-RTE-008` | Runtime availability MUST được xét khi chọn skill | Disabled/unavailable resource bị loại |
+| `FR-RTE-009` | Explicit target ngoài whitelist MUST không fallback | Trả `UNSUPPORTED`, nêu target chưa hỗ trợ |
+| `FR-RTE-010` | Runtime MAY hỏi user có muốn thêm target vào whitelist | Câu hỏi không tự thay đổi Registry hoặc tạo side effect |
 
 ## 9. Yêu cầu dialogue và confirmation
 
@@ -202,6 +210,7 @@ Clarification, confirmation và cancellation là runtime control flow, không ph
 | `NFR-MNT-002` | Mỗi schema MUST có một authority | Không duplicate giữa manifest/code/docs |
 | `NFR-MNT-003` | Skill/resource manifests MUST validate khi load | Invalid manifest không enable |
 | `NFR-MNT-004` | Adapter implementation MAY thay đổi mà giữ public contract | Skill không phụ thuộc path/class nội bộ |
+| `NFR-MNT-005` | Registry MUST là machine-readable authority; Skill.md là documentation | Conflict được xử lý theo Registry và docs phải đồng bộ |
 
 ### 12.4. Performance
 

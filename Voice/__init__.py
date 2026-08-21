@@ -1,4 +1,4 @@
-"""Voice process: microphone capture -> Faster-Whisper -> VOICE_FINAL text.
+"""Voice process: microphone capture -> NVIDIA Parakeet -> VOICE_FINAL text.
 
 Sở hữu microphone stream và transcriber. Chỉ `VOICE_FINAL` gửi tiếp; không lưu audio.
 """
@@ -37,19 +37,13 @@ class VoiceEvent:
 class VoiceProcess:
     def __init__(
         self,
-        model_size: str = "small",
-        device: str = "auto",
-        compute_type: str = "float16",
+        model_name: str = "nvidia/parakeet-ctc-0.6b-vi",
         sample_rate: int = 16000,
-        vad_timeout: float = 5.0,
-        end_of_speech: float = 0.5,
+        min_rms: float = 0.02,
         on_event: Optional[Callable[[VoiceEvent], None]] = None,
     ):
         self.capture = MicrophoneCapture(sample_rate=sample_rate)
-        self.transcriber = Transcriber(model_size=model_size, device=device,
-                                       compute_type=compute_type)
-        self.vad_timeout = vad_timeout
-        self.end_of_speech = end_of_speech
+        self.transcriber = Transcriber(model_name=model_name, sample_rate=sample_rate, min_rms=min_rms)
         self.on_event = on_event
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
@@ -62,7 +56,7 @@ class VoiceProcess:
     def stop(self):
         self._stop.set()
         if self._thread:
-            self._thread.join(timeout=5)
+            self._thread.join()
 
     def _emit(self, event: VoiceEvent):
         if self.on_event:
@@ -77,29 +71,23 @@ class VoiceProcess:
             return
         self._emit(VoiceEvent(event="VOICE_STARTED"))
         buffer = []
-        last_activity = time.monotonic()
         try:
             while not self._stop.is_set():
                 chunk = self.capture.poll(timeout=0.1)
                 if chunk is None:
-                    if buffer and (time.monotonic() - last_activity) > self.end_of_speech:
-                        # hết câu → transcribe
-                        audio = np.concatenate(buffer) if len(buffer) > 1 else buffer[0]
-                        text, lang, conf = self.transcriber.transcribe(audio)
-                        if text:
-                            self._emit(VoiceEvent(event="VOICE_FINAL", text=text,
-                                                  language=lang, confidence=conf))
-                        else:
-                            self._emit(VoiceEvent(event="VOICE_CANCELLED"))
-                        buffer = []
-                    elif buffer and (time.monotonic() - last_activity) > self.vad_timeout:
-                        self._emit(VoiceEvent(event="VOICE_CANCELLED"))
-                        buffer = []
                     continue
                 buffer.append(chunk)
-                last_activity = time.monotonic()
         finally:
             self.capture.stop()
+        if buffer:
+            audio = np.concatenate(buffer) if len(buffer) > 1 else buffer[0]
+            text, lang, conf = self.transcriber.transcribe(audio)
+            self._emit(VoiceEvent(
+                event="VOICE_FINAL" if text else "VOICE_CANCELLED",
+                text=text,
+                language=lang,
+                confidence=conf,
+            ))
 
 
 if __name__ == "__main__":

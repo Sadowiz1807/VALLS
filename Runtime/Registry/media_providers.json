@@ -1,0 +1,10 @@
+[
+  {
+    "provider_id": "spotify",
+    "name": "Spotify",
+    "aliases": ["spotify", "default"],
+    "enabled": true,
+    "helper": "spotify-local-control",
+    "device": "Web Player (Chrome)"
+  }
+]

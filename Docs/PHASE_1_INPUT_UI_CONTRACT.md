@@ -8,7 +8,7 @@
 Pipeline của Phase 1:
 
 ```text
-Microphone → Voice Process → Faster-Whisper → VOICE_FINAL.text
+Microphone → Voice Process → NVIDIA Parakeet CTC 0.6B Vietnamese → VOICE_FINAL.text
 ```
 
 Event:
@@ -35,19 +35,19 @@ VOICE_ERROR
 }
 ```
 
-## 2. Faster-Whisper
+## 2. NVIDIA Parakeet
 
 ```text
-model size: small
-compute type: float16
-device: GPU
+model: nvidia/parakeet-ctc-0.6b-vi
+runtime: NeMo 2.6
+device: theo PyTorch runtime hiện có (CPU đã được kiểm chứng)
 microphone: sounddevice
 sample rate: 16 kHz
-VAD: Silero VAD
-no-speech timeout: 5 seconds
+no-speech: RMS gate, mặc định 0.02 và có thể hiệu chỉnh
+stop policy: chỉ transcribe sau explicit stop
 ```
 
-Voice Process sở hữu microphone stream và Faster-Whisper. Chỉ `VOICE_FINAL` được gửi tiếp. Không lưu audio.
+Voice Process sở hữu microphone stream và NVIDIA Parakeet. Chỉ `VOICE_FINAL` được gửi tiếp. WAV tạm chỉ tồn tại trong lúc inference và luôn được dọn.
 
 ## 3. Pygame window
 
@@ -128,7 +128,7 @@ ERROR             → error → normal
 ## 8. Definition of Done
 
 - [x] Voice event contract.
-- [x] Faster-Whisper settings.
+- [x] NVIDIA Parakeet settings.
 - [x] Pygame window settings.
 - [x] Action visual contract (màu + decoration).
 - [x] State timeout/cancel policy.

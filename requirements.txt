@@ -1,1 +1,6 @@
 pygame>=2.5,<3
+numpy>=1.26,<2
+sounddevice>=0.5,<1
+nemo_toolkit[asr]==2.6.0
+spotipy>=2.24,<3
+python-dotenv>=1,<2
