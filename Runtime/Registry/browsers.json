@@ -8,7 +8,7 @@
     ],
     "enabled": true,
     "local": {
-      "executable": "chrome.exe"
+      "executable": "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe"
     }
   },
   {
@@ -21,7 +21,7 @@
     ],
     "enabled": true,
     "local": {
-      "executable": "browser.exe"
+      "executable": "C:\\Program Files\\CocCoc\\Browser\\Application\\browser.exe"
     }
   },
   {

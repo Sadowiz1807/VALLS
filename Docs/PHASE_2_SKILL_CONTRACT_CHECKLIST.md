@@ -1,7 +1,7 @@
 # Phase 2 — Skill thực chiến: Contract & Execution Checklist
 
 **Ngày:** 2026-08-21  
-**Trạng thái:** `PARTIAL — 5 SKILL REAL UAT PASS; BLOCKED BY VSAD SEMANTIC GATE`  
+**Trạng thái:** `PASS — ALL CURRENT SKILLS ACCEPTED WITH GENERATED METADATA; VSAD RETRAIN DEFERRED`  
 **Phase 1 evidence:** `Artifacts/UserPlan_Phase1_Report.md` — PASS
 
 > File này là gate duy nhất trước khi code Phase 2. Approval cho phép bắt đầu implementation; checkbox Gate 1–6 chỉ được tick sau khi có evidence thật.
@@ -12,7 +12,8 @@
 Skills/
 ├── ApplicationControl/Skill.md
 ├── WebControl/Skill.md
-└── MediaControl/Skill.md
+├── MediaControl/Skill.md
+└── SystemControl/Skill.md
 
 Runtime/
 ├── Registry/                 # whitelist/config authority
@@ -67,10 +68,15 @@ Skill là workflow. Resource là operation nguyên tử. Model không được t
 | 4 | `media.play` | optional `query`, `platform` | `media.catalog.resolve`, `media.playback.play` | LOW | Provider xác nhận playback hoặc trả lỗi |
 | 5 | `media.transport` | `action` | `media.playback.pause/resume/stop/next/previous` | LOW | Trạng thái playback thay đổi hoặc trả lỗi |
 
-### Ngoài phạm vi MVP
+### Phạm vi đã mở rộng và được user duyệt
 
-- `system.command`: shutdown/restart/sleep/lock/screenshot.
-- `media.volume`, `web.search`, `web.navigate`, `tab.manage`.
+- `web.close`: đóng đúng tab web theo entity/title Registry.
+- `system.power`: shutdown/restart/sleep.
+- `system.brightness`, `system.volume`, `system.night_light`.
+
+### Vẫn ngoài phạm vi
+
+- Lock/screenshot, `web.search`, `web.navigate`, tab switching đầy đủ.
 - TTS, browser automation đầy đủ, raw shell, plugin marketplace.
 - Skill riêng cho từng app/provider.
 
@@ -279,7 +285,8 @@ Rules:
 
 ### Gate 5 — Integration
 
-- [ ] `VOICE_FINAL → VSAD → skill → resource → result → UI` dry-run PASS.
+- [ ] `VOICE_FINAL → VSAD → skill → resource → result → UI` PASS — deferred đến sau VSAD retrain.
+- [x] Generated valid metadata → skill → resource → observed result PASS.
 - [x] Unknown/malformed/ambiguous inputs fail closed.
 - [x] Response không claim success từ mock/planned result.
 - [x] Full test suite PASS.
@@ -290,13 +297,16 @@ Rules:
 - [x] Application open/close có process evidence.
 - [x] Web open có browser/URL evidence.
 - [x] Media play/transport có provider playback evidence.
+- [x] Web close có tab-level evidence và không kill browser.
+- [x] System brightness/volume/Night Light/Sleep có state evidence thật và rollback khi phù hợp.
+- [x] Shutdown/restart được user nghiệm thu PASS theo confirmation + Windows operation evidence.
 - [x] Lưu report; không lưu secret hoặc raw audio.
 
 ## 10. Definition of Done Phase 2
 
-Phase 2 chỉ PASS khi:
+Phase 2 skill/runtime acceptance hiện PASS khi dùng generated valid metadata:
 
-- [ ] Năm skill MVP resolve đúng semantic contract.
+- [x] Mọi skill hiện tại resolve đúng generated semantic contract.
 - [x] Không còn executor trả success giả.
 - [x] Mọi dependency tồn tại/enabled và schema hợp lệ.
 - [x] Dry-run mặc định, real-run explicit.
@@ -305,6 +315,8 @@ Phase 2 chỉ PASS khi:
 - [x] Full current test suite PASS.
 - [x] Controlled UAT có evidence thật PASS.
 - [x] Runtime registry/docs khớp implementation.
+
+Full Voice/VSAD integration là gate riêng được hoãn đến sau retraining; không dùng parser hard-code để ghi đè model.
 
 ## 11. User approval
 

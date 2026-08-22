@@ -72,6 +72,29 @@
     "enabled": true
   },
   {
+    "skill_id": "web.close",
+    "description": "Đóng đúng cửa sổ web theo title whitelist",
+    "enabled": true,
+    "accepts": {
+      "act": [
+        "EXECUTE"
+      ],
+      "goal": "APPLICATION_CONTROL",
+      "action": "CLOSE"
+    },
+    "inputs": {
+      "title": {
+        "type": "string",
+        "required": true
+      }
+    },
+    "resources": [
+      "browser.window.close"
+    ],
+    "risk": "MEDIUM",
+    "confirmation_required": false
+  },
+  {
     "skill_id": "media.play",
     "description": "Phát nội dung media",
     "accepts": {
@@ -135,47 +158,6 @@
     "enabled": true
   },
   {
-    "skill_id": "system.command",
-    "description": "Thực thi lệnh hệ thống",
-    "accepts": {
-      "act": [
-        "EXECUTE"
-      ],
-      "goal": "RUN_COMMAND"
-    },
-    "inputs": {
-      "command_id": {
-        "type": "string",
-        "required": true
-      }
-    },
-    "resources": [
-      "system.command.execute"
-    ],
-    "risk_by_command": {
-      "SHUTDOWN_SYSTEM": {
-        "risk": "HIGH",
-        "confirmation_required": true
-      },
-      "RESTART_SYSTEM": {
-        "risk": "HIGH",
-        "confirmation_required": true
-      },
-      "SLEEP_SYSTEM": {
-        "risk": "LOW",
-        "confirmation_required": false
-      },
-      "LOCK_SCREEN": {
-        "risk": "LOW",
-        "confirmation_required": false
-      },
-      "TAKE_SCREENSHOT": {
-        "risk": "LOW",
-        "confirmation_required": false
-      }
-    }
-  },
-  {
     "skill_id": "conversation.social",
     "description": "Phản hồi xã hội (chào hỏi, cảm ơn)",
     "accepts": {
@@ -194,6 +176,117 @@
       "response.renderer.social"
     ],
     "risk": "NONE",
+    "confirmation_required": false
+  },
+  {
+    "skill_id": "system.power",
+    "description": "Shutdown, restart hoặc sleep thiết bị",
+    "enabled": true,
+    "accepts": {
+      "act": [
+        "EXECUTE"
+      ],
+      "goal": "SYSTEM_CONTROL",
+      "action": [
+        "SHUTDOWN",
+        "RESTART",
+        "SLEEP"
+      ]
+    },
+    "inputs": {
+      "action": {
+        "type": "string",
+        "required": true
+      }
+    },
+    "resources": [
+      "system.power"
+    ],
+    "risk_by_action": {
+      "SHUTDOWN": "HIGH",
+      "RESTART": "HIGH",
+      "SLEEP": "MEDIUM"
+    },
+    "confirmation_required_by_action": {
+      "SHUTDOWN": true,
+      "RESTART": true,
+      "SLEEP": false
+    }
+  },
+  {
+    "skill_id": "system.brightness",
+    "description": "Đặt độ sáng màn hình theo phần trăm",
+    "enabled": true,
+    "accepts": {
+      "act": [
+        "EXECUTE"
+      ],
+      "goal": "SYSTEM_CONTROL",
+      "action": "SET_BRIGHTNESS"
+    },
+    "inputs": {
+      "value": {
+        "type": "integer",
+        "required": true,
+        "minimum": 0,
+        "maximum": 100
+      }
+    },
+    "resources": [
+      "system.brightness.set"
+    ],
+    "risk": "LOW",
+    "confirmation_required": false
+  },
+  {
+    "skill_id": "system.volume",
+    "description": "Đặt âm lượng hệ thống theo phần trăm",
+    "enabled": true,
+    "accepts": {
+      "act": [
+        "EXECUTE"
+      ],
+      "goal": "SYSTEM_CONTROL",
+      "action": "SET_VOLUME"
+    },
+    "inputs": {
+      "value": {
+        "type": "integer",
+        "required": true,
+        "minimum": 0,
+        "maximum": 100
+      }
+    },
+    "resources": [
+      "system.volume.set"
+    ],
+    "risk": "LOW",
+    "confirmation_required": false
+  },
+  {
+    "skill_id": "system.night_light",
+    "description": "Bật hoặc tắt Windows Night Light",
+    "enabled": true,
+    "accepts": {
+      "act": [
+        "EXECUTE"
+      ],
+      "goal": "SYSTEM_CONTROL",
+      "action": [
+        "NIGHT_LIGHT_ON",
+        "NIGHT_LIGHT_OFF"
+      ]
+    },
+    "inputs": {
+      "enabled": {
+        "type": "boolean",
+        "required": true
+      }
+    },
+    "resources": [
+      "system.night_light.set"
+    ],
+    "risk": "LOW",
     "confirmation_required": false
   }
 ]

@@ -56,5 +56,43 @@
     ],
     "executable": "notepad.exe",
     "enabled": true
+  },
+  {
+    "app_id": "facebook",
+    "name": "Facebook",
+    "aliases": [
+      "facebook",
+      "face book"
+    ],
+    "type": "web",
+    "window_title": "Facebook",
+    "enabled": true,
+    "web": {
+      "url": "https://www.facebook.com",
+      "browsers": [
+        "chrome",
+        "coccoc",
+        "edge"
+      ]
+    }
+  },
+  {
+    "app_id": "youtube",
+    "name": "YouTube",
+    "aliases": [
+      "youtube",
+      "you tube"
+    ],
+    "type": "web",
+    "window_title": "YouTube",
+    "enabled": true,
+    "web": {
+      "url": "https://www.youtube.com",
+      "browsers": [
+        "chrome",
+        "coccoc",
+        "edge"
+      ]
+    }
   }
 ]

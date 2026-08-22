@@ -2,12 +2,38 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+import time
 import webbrowser
 from pathlib import Path
 from typing import Callable
 from urllib.parse import urlparse
 
 from .Registry import resolve
+
+
+def enum_windows() -> list[tuple[int, str]]:
+    import win32gui
+    windows = []
+    win32gui.EnumWindows(lambda handle, _: windows.append((handle, win32gui.GetWindowText(handle))) if win32gui.IsWindowVisible(handle) else None, None)
+    return windows
+
+
+def close_tabs(handle: int, title: str) -> int:
+    from pywinauto import Desktop
+    closed = 0
+    for _ in range(20):
+        window = Desktop(backend="uia").window(handle=handle)
+        tabs = [tab for tab in window.descendants(control_type="TabItem") if title.casefold() in tab.window_text().casefold()]
+        if not tabs:
+            return closed
+        buttons = [button for tab in tabs for button in tab.descendants(control_type="Button")
+                   if button.element_info.class_name == "TabCloseButton"]
+        if len(buttons) != 1:
+            raise RuntimeError("TAB_CLOSE_CONTROL_AMBIGUOUS")
+        buttons[0].invoke()
+        closed += 1
+        time.sleep(0.5)
+    raise RuntimeError("TAB_CLOSE_LIMIT_EXCEEDED")
 
 
 class Browser:
@@ -43,3 +69,19 @@ class Browser:
             return {"ok": True, "resource_id": "browser.navigation.open", "resolved": {"url": url, "browser": browser}, "evidence": evidence, "error": None}
         except OSError as exc:
             return {"ok": False, "resource_id": "browser.navigation.open", "error": str(exc)}
+
+    @staticmethod
+    def close_title(title: str, execute: bool = False) -> dict:
+        matches = [(handle, text) for handle, text in enum_windows() if title.casefold() in text.casefold()]
+        if len(matches) != 1:
+            return {"ok": False, "resource_id": "browser.window.close", "error": "WINDOW_NOT_FOUND" if not matches else "WINDOW_AMBIGUOUS"}
+        if not execute:
+            return {"ok": False, "resource_id": "browser.window.close", "error": "EXECUTION_DISABLED", "dry_run": True}
+        handle, text = matches[0]
+        try:
+            closed = close_tabs(handle, title)
+        except RuntimeError as exc:
+            return {"ok": False, "resource_id": "browser.window.close", "error": str(exc)}
+        if not closed:
+            return {"ok": False, "resource_id": "browser.window.close", "error": "TAB_NOT_FOUND"}
+        return {"ok": True, "resource_id": "browser.window.close", "evidence": {"handle": handle, "title": text, "closed_tabs": closed}, "error": None}

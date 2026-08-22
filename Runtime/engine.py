@@ -19,8 +19,8 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Sequence
 
-from Runtime.Resources import Application, Browser, Media
-from Runtime.Skills import ApplicationControl, MediaControl, WebControl
+from Runtime.Resources import Application, Browser, Media, System
+from Runtime.Skills import ApplicationControl, MediaControl, SystemControl, WebControl
 
 def normalize_text(text: str) -> str:
     if not text:
@@ -150,15 +150,22 @@ class AgentHarness:
         application = Application(registry_dir / "applications.json", runner=self.runner)
         web = Browser(registry_dir / "browsers.json", opener=self.web_opener, runner=self.runner)
         media = Media(registry_dir / "media_providers.json")
+        system = System(registry_dir / "system.json")
         application_skill = ApplicationControl(application)
         web_skill = WebControl(web)
         media_skill = MediaControl(media)
+        system_skill = SystemControl(system)
         self.skill_handlers = {
             "application.open": lambda args: application_skill.open(args.get("application", ""), self.execute),
             "application.close": lambda args: application_skill.close(args.get("application", ""), self.execute),
             "web.open": lambda args: web_skill.open(args.get("url", ""), args.get("browser"), self.execute),
+            "web.close": lambda args: web_skill.close(args.get("title", ""), self.execute),
             "media.play": lambda args: media_skill.play(args.get("query", ""), args.get("platform", "spotify"), self.execute),
             "media.transport": lambda args: media_skill.transport(args.get("action", ""), args.get("platform", "spotify"), self.execute),
+            "system.power": lambda args: system_skill.power(args.get("action", ""), self.execute),
+            "system.brightness": lambda args: system_skill.brightness(args.get("value"), self.execute),
+            "system.volume": lambda args: system_skill.volume(args.get("value"), self.execute),
+            "system.night_light": lambda args: system_skill.night_light(args.get("enabled"), self.execute),
         }
 
     def step(self, raw_input: str, vsad_model: Any) -> Dict[str, Any]:
@@ -258,6 +265,10 @@ class AgentHarness:
                 return {"status": "UNSUPPORTED", "reason": "ACTION_NOT_SUPPORTED", "response": f"Chưa hỗ trợ tác vụ {action} với ứng dụng."}
 
             if action == "CLOSE":
+                if resolved_app.get("type") == "web":
+                    result = self._execute_skill("web.close", {"title": resolved_app.get("window_title", resolved_app["name"])})
+                    return {"status": "EXECUTED" if result["ok"] else "ERROR", "skill_id": "web.close", "result": result,
+                            "response": "Đã đóng trang web." if result["ok"] else f"Không thể đóng trang web: {result.get('error')}."}
                 self.pending_frame = PendingFrame(
                     skill_id="application.close", arguments={"application": resolved_app["app_id"]}, risk="MEDIUM",
                     created_at=datetime.now(), expires_at=datetime.now() + timedelta(seconds=60),
@@ -312,11 +323,39 @@ class AgentHarness:
             return {"status": status, "skill_id": skill_id, "result": exec_result,
                     "response": f"Đã thực hiện media: {raw_query or action}." if exec_result["ok"] else f"Không thể thực hiện media: {exec_result.get('error')}."}
 
+        if goal == "SYSTEM_CONTROL":
+            action = params.get("action", "").upper()
+            if action in ("SHUTDOWN", "RESTART"):
+                description = "tắt nguồn" if action == "SHUTDOWN" else "khởi động lại"
+                self.pending_frame = PendingFrame(
+                    skill_id="system.power", arguments={"action": action}, risk="HIGH",
+                    created_at=datetime.now(), expires_at=datetime.now() + timedelta(seconds=60),
+                    description=description,
+                )
+                return {"status": "AWAITING_CONFIRMATION", "skill_id": "system.power", "risk": "HIGH",
+                        "response": f"Bạn có chắc chắn muốn {description} không?"}
+            mapping = {
+                "SLEEP": ("system.power", {"action": "SLEEP"}),
+                "SET_BRIGHTNESS": ("system.brightness", {"value": params.get("value")}),
+                "SET_VOLUME": ("system.volume", {"value": params.get("value")}),
+                "NIGHT_LIGHT_ON": ("system.night_light", {"enabled": True}),
+                "NIGHT_LIGHT_OFF": ("system.night_light", {"enabled": False}),
+            }
+            if action not in mapping:
+                return {"status": "UNSUPPORTED", "reason": "ACTION_NOT_SUPPORTED", "response": f"Chưa hỗ trợ system action {action}."}
+            skill_id, arguments = mapping[action]
+            exec_result = self._execute_skill(skill_id, arguments)
+            status = ("EXECUTED" if exec_result["ok"] else "ROUTED" if exec_result.get("error") == "EXECUTION_DISABLED"
+                      else "UNSUPPORTED" if exec_result.get("error") in ("SKILL_DISABLED", "CAPABILITY_DISABLED") else "ERROR")
+            return {"status": status, "skill_id": skill_id, "result": exec_result,
+                    "response": "Đã thực hiện điều khiển hệ thống." if exec_result["ok"] else f"Không thể điều khiển hệ thống: {exec_result.get('error')}."}
+
         if goal == "RUN_COMMAND":
             cmd_id = params.get("command_id")
             if cmd_id == "SLEEP_SYSTEM":
                 exec_result = self._execute_skill("system.command", {"command_id": "SLEEP_SYSTEM"})
-                return {"status": "EXECUTED", "skill_id": "system.command", "result": exec_result, "response": "Đang đưa máy tính vào chế độ ngủ."}
+                return {"status": "EXECUTED" if exec_result["ok"] else "ERROR", "skill_id": "system.command", "result": exec_result,
+                        "response": "Đang đưa máy tính vào chế độ ngủ." if exec_result["ok"] else f"Không thể đưa máy vào chế độ ngủ: {exec_result.get('error')}."}
             if cmd_id in ("SHUTDOWN_SYSTEM", "RESTART_SYSTEM"):
                 desc = "tắt máy tính" if cmd_id == "SHUTDOWN_SYSTEM" else "khởi động lại máy tính"
                 self.pending_frame = PendingFrame(
@@ -358,9 +397,11 @@ class AgentHarness:
         return f"Dry-run: sẵn sàng mở {app_name} qua {result['route']}."
 
     def _execute_skill(self, skill_id: str, args: Dict[str, Any]) -> Dict[str, Any]:
-        enabled = any(item.get("skill_id") == skill_id and item.get("enabled", True) for item in self.skills)
-        if not enabled:
+        skill = next((item for item in self.skills if item.get("skill_id") == skill_id), None)
+        if not skill:
             return {"ok": False, "skill_id": skill_id, "error": "SKILL_NOT_FOUND"}
+        if not skill.get("enabled", True):
+            return {"ok": False, "skill_id": skill_id, "error": "SKILL_DISABLED"}
         handler = self.skill_handlers.get(skill_id)
         if not handler:
             return {"ok": False, "skill_id": skill_id, "error": "SKILL_NOT_IMPLEMENTED"}

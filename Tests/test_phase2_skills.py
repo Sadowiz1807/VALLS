@@ -29,37 +29,37 @@ def write_registry(path: Path):
     ]), encoding="utf-8")
 
 
-def test_application_close_uses_windows_force_flag(monkeypatch):
-    import importlib
-    module = importlib.import_module("Runtime.Resources.Application")
-    calls = []
-    monkeypatch.setattr(module.subprocess, "run", lambda argv, **kwargs: calls.append(argv) or type(
-        "Completed", (), {"returncode": 0, "stdout": "", "stderr": ""}
-    )())
-
-    evidence = Application._close("notepad.exe")
-
-    assert evidence == {"returncode": 0}
-    assert calls == [["taskkill", "/IM", "notepad.exe", "/T", "/F"]]
-
-
-def test_application_open_and_close_have_observed_evidence(tmp_path):
+def test_application_open_and_close_use_owned_window_only(tmp_path):
     write_registry(tmp_path)
-    running = set()
-
-    def start(argv):
-        running.add(argv[0])
-        return type("Process", (), {"pid": 42})()
-
-    resource = Application(tmp_path / "applications.json", runner=start,
-                           closer=lambda executable: running.remove(executable) or {"pid": 42})
+    snapshots = iter([
+        [],
+        [{"handle": 7, "pid": 42, "title": "Untitled - Notepad"}],
+    ])
+    closed = []
+    resource = Application(
+        tmp_path / "applications.json",
+        runner=lambda _argv: type("Process", (), {"pid": 1})(),
+        observer=lambda: next(snapshots),
+        closer=lambda handle: closed.append(handle) or {"handle": handle, "closed": True},
+    )
     skill = ApplicationControl(resource)
 
     opened = skill.open("notepad", execute=True)
-    closed = skill.close("notepad", execute=True)
+    closed_result = skill.close("notepad", execute=True)
 
-    assert opened["ok"] is True and opened["evidence"] == {"pid": 42}
-    assert closed["ok"] is True and closed["evidence"] == {"pid": 42}
+    assert opened["ok"] is True and opened["evidence"] == {
+        "handle": 7, "pid": 42, "title": "Untitled - Notepad"
+    }
+    assert closed_result["ok"] is True
+    assert closed == [7]
+
+
+def test_application_close_without_owned_window_fails_closed(tmp_path):
+    write_registry(tmp_path)
+    result = Application(tmp_path / "applications.json").close("notepad", execute=True)
+
+    assert result["ok"] is False
+    assert result["error"] == "NO_OWNED_WINDOW"
 
 
 def test_web_open_rejects_browser_outside_registry(tmp_path):
@@ -156,6 +156,20 @@ def test_confirmed_skill_failure_returns_error_status(tmp_path):
 
     assert result["status"] == "ERROR"
     assert result["result"]["ok"] is False
+
+
+def test_sleep_unimplemented_never_returns_executed(tmp_path):
+    write_registry(tmp_path)
+    skills = json.loads((tmp_path / "skills.json").read_text(encoding="utf-8"))
+    skills.append({"skill_id": "system.command", "enabled": True})
+    (tmp_path / "skills.json").write_text(json.dumps(skills), encoding="utf-8")
+
+    result = AgentHarness(tmp_path, execute=True)._dispatch_turn("về chế độ sleep", {
+        "act": "EXECUTE", "goal": "RUN_COMMAND", "parameters": {"command_id": "SLEEP_SYSTEM"},
+    })
+
+    assert result["status"] == "ERROR"
+    assert result["result"]["error"] == "SKILL_NOT_IMPLEMENTED"
 
 
 def test_harness_unknown_skill_never_returns_success(tmp_path):

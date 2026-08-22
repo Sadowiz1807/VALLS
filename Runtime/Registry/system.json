@@ -1,0 +1,20 @@
+{
+  "power": {
+    "enabled": true,
+    "actions": ["SHUTDOWN", "RESTART", "SLEEP"]
+  },
+  "brightness": {
+    "enabled": true,
+    "min": 0,
+    "max": 100
+  },
+  "volume": {
+    "enabled": true,
+    "min": 0,
+    "max": 100
+  },
+  "night_light": {
+    "enabled": true,
+    "backend": "windows_settings_uia"
+  }
+}

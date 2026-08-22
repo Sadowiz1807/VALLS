@@ -1,7 +1,21 @@
 import json
+import importlib
 from pathlib import Path
 
 from Runtime.engine import AgentHarness
+
+
+def test_browser_close_window_matches_title_without_killing_process(monkeypatch):
+    module = importlib.import_module("Runtime.Resources.Browser")
+    closed = []
+    monkeypatch.setattr(module, "enum_windows", lambda: [(10, "YouTube - Cốc Cốc"), (11, "Facebook - Chrome")])
+    monkeypatch.setattr(module, "close_tabs", lambda handle, title: closed.append((handle, title)) or 2)
+
+    result = module.Browser.close_title("youtube", execute=True)
+
+    assert result["ok"] is True
+    assert result["evidence"]["closed_tabs"] == 2
+    assert closed == [(10, "youtube")]
 
 
 def registry(tmp_path: Path) -> Path:
@@ -36,14 +50,17 @@ def frame(**parameters):
 
 def test_local_dispatch_reports_started_process(monkeypatch, tmp_path):
     calls = []
+    snapshots = iter([[], [{"handle": 7, "pid": 42, "title": "Spotify"}]])
     monkeypatch.setattr("Runtime.engine.shutil.which", lambda executable: executable)
+    application_module = importlib.import_module("Runtime.Resources.Application")
+    monkeypatch.setattr(application_module, "observe_windows", lambda: next(snapshots))
     harness = AgentHarness(registry(tmp_path), execute=True, runner=lambda argv: calls.append(argv) or Process())
 
     result = harness._dispatch_turn("mở spotify", frame())
 
     assert result["status"] == "EXECUTED"
     assert result["result"]["ok"] is True
-    assert result["result"]["evidence"] == {"pid": 42}
+    assert result["result"]["evidence"] == {"handle": 7, "pid": 42, "title": "Spotify"}
     assert calls == [["spotify.exe"]]
 
 
