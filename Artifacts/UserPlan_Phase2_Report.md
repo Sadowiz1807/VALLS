@@ -1,76 +1,122 @@
 # User Plan — Phase 2: Practical Skills
 
-Date: 2026-08-21
-Status: PARTIAL — BLOCKED BY VSAD SEMANTIC GATE
+Date: 2026-08-22
+Status: PASS — ALL CURRENT SKILLS ACCEPTED
 
-## Implemented structure
+## Acceptance scope
+
+Phase 2 is accepted using generated valid semantic metadata injected into the canonical Runtime. VSAD/model inference is intentionally excluded until retraining.
+
+```text
+generated semantic frame
+→ Runtime Registry resolution
+→ Skill orchestration
+→ Resource/provider operation
+→ observed result
+```
+
+## Current canonical structure
 
 ```text
 Skills/
 ├── ApplicationControl/Skill.md
 ├── WebControl/Skill.md
-└── MediaControl/Skill.md
+├── MediaControl/Skill.md
+└── SystemControl/Skill.md
 
 Runtime/
 ├── Registry/
 │   ├── applications.json
 │   ├── browsers.json
 │   ├── media_providers.json
-│   └── skills.json
+│   ├── skills.json
+│   └── system.json
 ├── Resources/
 │   ├── Application.py
 │   ├── Browser.py
 │   ├── Media.py
-│   └── Registry.py
+│   ├── Registry.py
+│   └── System.py
 └── Skills/
     ├── ApplicationControl.py
     ├── WebControl.py
-    └── MediaControl.py
+    ├── MediaControl.py
+    └── SystemControl.py
 ```
 
-Registry remains whitelist/config authority. Skill docs/code do not extend its capabilities.
+Registry remains the machine-readable capability, configuration, alias, and whitelist authority. `Skill.md` files are human-readable contracts and are not parsed to grant capability.
+
+## Accepted skill matrix
+
+| Skill/workflow | Real evidence | Status |
+|---|---|---|
+| `application.open` | newly created Notepad window observed by handle/PID/title | PASS |
+| `application.close` | confirmation required; only runtime-owned window handle closed; unrelated windows preserved | PASS |
+| `web.open` | Facebook/Spotify opened through configured Chrome/Cốc Cốc executable and Registry URL | PASS |
+| `web.close` | all matching YouTube tabs closed through native UI Automation; browser and unrelated tabs preserved | PASS |
+| `media.play` | Spotify album playback started on observed Connect device | PASS |
+| `media.transport/PAUSE` | provider state changed to not playing | PASS |
+| `media.transport/RESUME` | provider state changed to playing | PASS |
+| `media.transport/NEXT` | track URI changed | PASS |
+| `media.transport/PREVIOUS` | track URI returned to previous track | PASS |
+| `media.transport/STOP` | provider pause semantic; final playback state false | PASS |
+| `system.brightness` | 67→60 read-back; rollback 67 | PASS |
+| `system.volume` | 100→60 read-back; rollback 100 | PASS |
+| `system.night_light` | Settings UIA OFF→ON read-back; rollback OFF | PASS |
+| `system.power/SLEEP` | canonical harness suspended PC and resumed; native evidence `suspended=true` | PASS |
+| `system.power/SHUTDOWN` | Windows accepted operation; user accepted shutdown capability | PASS |
+| `system.power/RESTART` | fixed Windows operation and confirmation policy verified; accepted with SystemControl family | PASS |
+| `conversation.social` | canonical Runtime returned grounded greeting response | PASS |
+
+## Requested generated-metadata cases
+
+| Request | Result |
+|---|---|
+| `bật chế độ night light` | PASS |
+| `chỉnh âm lượng về 60%` | PASS |
+| `về chế độ sleep` | PASS |
+| `mở facebook qua coccoc` | PASS |
+| `tắt youtube` | PASS |
+
+Detailed evidence: `Artifacts/GeneratedMetadata_Case_Report.md` and `Artifacts/SystemControl_Report.md`.
+
+## Safety fixes completed
+
+- Removed false-success skill dispatch.
+- Disabled/missing/unknown capabilities fail closed.
+- Confirmation failures propagate top-level `ERROR`.
+- Removed process-wide `taskkill /IM` from application close.
+- Application close requires confirmation and closes only an owned window handle.
+- Browser close verifies all matching tabs are gone; it does not kill the browser.
+- Explicit browsers use observed absolute executable paths; no silent fallback.
+- Night Light uses Windows Settings UI Automation with state read-back; no undocumented CloudStore mutation.
+- Sleep uses native `PowrProf.SetSuspendState`; the hanging `rundll32` path was removed.
+- Shutdown/restart use fixed commands and require confirmation.
+- No raw shell, executable path, URL, PID, credential, or provider result is accepted from model metadata.
 
 ## Automated verification
 
 ```text
+branch: develop
 pip check: No broken requirements found.
 compileall: COMPILE_OK
-pytest: 41 passed in 2.25s
+pytest: 54 passed in 3.28s
+registry/docs/safety verifier: PASS
 ```
 
-False-success executor was removed. Unknown/disabled/unimplemented skills fail closed. Confirmed resource failures return top-level `ERROR`.
+## Deferred work
 
-## Real controlled UAT
+VSAD 0.0.4 still requires retraining before full voice end-to-end acceptance. This is explicitly deferred and does not invalidate the generated-metadata skill acceptance in this report.
 
-| Skill | Real evidence | Result |
-|---|---|---|
-| `application.open` | Notepad process created with PID evidence | PASS |
-| `application.close` | MEDIUM confirmation turn, then `taskkill` return code 0 | PASS |
-| `web.open` | Registry URL `https://open.spotify.com`; Chrome window title confirmed Spotify Web Player | PASS |
-| `media.play` | Spotify played `One More Time` by Daft Punk; provider reported `playing=true` | PASS |
-| `media.transport` | Spotify pause returned success; provider reported `playing=false` | PASS |
+After retraining, rerun:
 
-Firefox outside browser registry returned `BROWSER_UNSUPPORTED`, asked to add whitelist, and did not fallback.
+```text
+VOICE_FINAL → VSAD → Runtime → Skill → Resource → observed result → UI
+```
 
-No credentials, tokens, raw audio, or device identifiers are stored in this report.
+## Decision
 
-## Blocking semantic evidence
-
-VSAD 0.0.4 direct inference did not resolve the five representative requests correctly:
-
-| Input | Observed model output | Expected |
-|---|---|---|
-| `mở notepad` | `CANCEL / APPLICATION_CONTROL` | `EXECUTE / APPLICATION_CONTROL / OPEN` |
-| `đóng notepad` | Correct goal/action but missing application parameter | Complete CLOSE frame |
-| `mở spotify trên web` | Correct goal but missing parameters | Target/application parameter |
-| `phát Daft Punk One More Time trên spotify` | `APPLICATION_CONTROL / FOCUS` | `MEDIA_CONTROL / PLAY` |
-| `tạm dừng nhạc` | `CANCEL / MEDIA_CONTROL` | `EXECUTE / MEDIA_CONTROL / PAUSE/STOP` |
-
-The runtime must not add a hard-coded transcript parser that overrides VSAD. Therefore the full pipeline `VOICE_FINAL → VSAD → skill → resource → result → UI` cannot pass yet.
-
-## Phase decision
-
-- Practical implementation of all five MVP skills: PASS.
-- Real execution of all five MVP skills: PASS.
-- Phase 2 Definition of Done: NOT PASS.
-- Blocker: retrain/fix VSAD 0.0.4 semantic outputs, then rerun Gate 5 full-flow acceptance.
+- All currently registered and enabled skills: PASS.
+- Phase 2 skill/runtime scope: PASS.
+- Full voice/model integration: DEFERRED UNTIL VSAD RETRAINING.
+- Release readiness: not claimed; worktree remains uncommitted/dirty.

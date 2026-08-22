@@ -2,3 +2,5 @@ Temp
 .venv*/
 __pycache__/
 *.pyc
+Tests
+Artifacts
