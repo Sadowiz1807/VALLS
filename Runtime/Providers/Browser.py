@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Callable
 from urllib.parse import urlparse
 
-from .Registry import resolve
+from Runtime.Resources.Registry import resolve
 
 
 def enum_windows() -> list[tuple[int, str]]:
@@ -36,7 +36,7 @@ def close_tabs(handle: int, title: str) -> int:
     raise RuntimeError("TAB_CLOSE_LIMIT_EXCEEDED")
 
 
-class Browser:
+class BrowserProvider:
     def __init__(self, registry: Path, opener: Callable[[str], bool] = webbrowser.open,
                  runner: Callable = subprocess.Popen):
         self.registry = registry

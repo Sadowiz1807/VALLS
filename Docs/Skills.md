@@ -43,33 +43,35 @@ flowchart LR
 ### 2.1. Cấu trúc source và ownership
 
 ```text
-Skills/<Family>/Skill.md          # human-readable contract
-Runtime/Registry/*.json           # whitelist/config authority
-Runtime/Skills/<Family>.py        # workflow implementation
-Runtime/Resources/<Domain>.py     # atomic operations
+Skills/<Family>/Skill.md        # human-readable contract
+Runtime/Registry/skills.json    # workflow/input/risk authority
+Runtime/Registry/resources.json # atomic capability catalog
+Runtime/Registry/providers.json # approved provider declarations
+Runtime/Skills/Executor.py      # manifest-driven workflow execution
+Runtime/Resources/Dispatcher.py # capability dispatch
+Runtime/Providers/*.py          # OS/API/package implementations
 ```
 
-- `Skill.md` mô tả family, trường hợp dùng, keywords tham khảo, workflow IDs, resources, risk và điều cấm.
-- Registry là source of truth mà runtime đọc để quyết định app, browser, provider, alias, resource, `enabled` và config được phép.
-- Runtime không parse `Skill.md` để cấp quyền. Khi tài liệu và registry khác nhau, registry thắng và tài liệu phải được đồng bộ.
-- Một Python class có thể chứa nhiều workflow methods theo cùng domain; mỗi method vẫn map tới một `skill_id` riêng.
-- Mỗi resource method vẫn map tới một public `resource_id` nguyên tử.
+- `Skill.md` mô tả behavior cho người đọc; runtime không parse file này để cấp quyền.
+- Registry là machine-readable authority cho skill, entity, resource, provider, risk và `enabled`.
+- `SkillExecutor` validate typed inputs; skill có `steps` thì dispatch tuần tự và dừng ở lỗi đầu tiên, skill atomic/action matrix chỉ dispatch resource được chọn.
+- `ResourceDispatcher` fail closed theo `resources.json`, resolve provider khả dụng và trả cả `resource_id` lẫn `provider_id` trong result.
+- Provider công bố availability theo capability; dependency Win32/UIA/API/package nằm sau provider boundary.
+- Target như YouTube, Spotify và Facebook là entity/data; target không quyết định Python implementation.
 
-Ví dụ:
+Luồng runtime:
 
 ```text
-Runtime/Skills/WebControl.py
-class WebControl
-  open()       → web.open
-  change_tab() → tab.manage
-
-Runtime/Resources/Browser.py
-class Browser
-  open()       → browser.navigation.open
-  switch_tab() → browser.tabs.switch
+semantic frame
+→ SkillExecutor
+→ resource_id
+→ ResourceDispatcher
+→ ProviderRegistry
+→ available provider
+→ observed result
 ```
 
-Tên class/file là implementation detail PascalCase; public ID vẫn dùng lowercase dot notation.
+Public ID dùng lowercase dot notation; tên class, language và package của provider là implementation detail.
 
 ## 3. Ranh giới Model và Runtime
 

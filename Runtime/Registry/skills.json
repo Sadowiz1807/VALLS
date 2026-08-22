@@ -20,7 +20,11 @@
       "application.control.open"
     ],
     "risk": "LOW",
-    "confirmation_required": false
+    "confirmation_required": false,
+    "steps": [
+      "application.catalog.resolve",
+      "application.control.open"
+    ]
   },
   {
     "skill_id": "application.close",
@@ -43,7 +47,11 @@
       "application.control.close"
     ],
     "risk": "MEDIUM",
-    "confirmation_required": true
+    "confirmation_required": true,
+    "steps": [
+      "application.catalog.resolve",
+      "application.control.close"
+    ]
   },
   {
     "skill_id": "web.open",
@@ -107,7 +115,7 @@
     "inputs": {
       "query": {
         "type": "string",
-        "required": false
+        "required": true
       },
       "platform": {
         "type": "string",

@@ -5,7 +5,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
-from .Registry import resolve
+from Runtime.Resources.Registry import resolve
 
 
 def observe_windows() -> list[dict[str, Any]]:
@@ -22,6 +22,17 @@ def observe_windows() -> list[dict[str, Any]]:
     return windows
 
 
+def parent_process_id(pid: int) -> int | None:
+    try:
+        import psutil
+    except ImportError:
+        return None
+    try:
+        return psutil.Process(pid).ppid()
+    except (psutil.Error, OSError):
+        return None
+
+
 def close_owned_window(handle: int) -> dict[str, Any]:
     import win32con
     import win32gui
@@ -36,21 +47,23 @@ def close_owned_window(handle: int) -> dict[str, Any]:
     raise OSError("WINDOW_CLOSE_FAILED")
 
 
-class Application:
+class ApplicationProvider:
     def __init__(self, registry: Path, runner: Callable = subprocess.Popen,
-                 closer: Callable | None = None, observer: Callable | None = None):
+                 closer: Callable | None = None, observer: Callable | None = None,
+                 parent_pid: Callable[[int], int | None] = parent_process_id):
         self.registry = registry
         self.runner = runner
         self.closer = closer or close_owned_window
         self.observer = observer or observe_windows
+        self.parent_pid = parent_pid
         self.owned: dict[str, dict[str, Any]] = {}
 
     @staticmethod
     def _executable(app: dict[str, Any]) -> str | None:
         return (app.get("local") or {}).get("executable") or app.get("executable")
 
-    def open(self, application: str, execute: bool = False) -> dict[str, Any]:
-        app = resolve(self.registry, application)
+    def open(self, application: str | dict[str, Any], execute: bool = False) -> dict[str, Any]:
+        app = application if isinstance(application, dict) else resolve(self.registry, application)
         if not app:
             return {"ok": False, "resource_id": "application.control.open", "error": "APPLICATION_UNSUPPORTED"}
         executable = self._executable(app)
@@ -60,12 +73,15 @@ class Application:
             return {"ok": False, "resource_id": "application.control.open", "error": "EXECUTION_DISABLED", "dry_run": True}
         try:
             before = {window["handle"] for window in self.observer()}
-            self.runner([executable])
+            process = self.runner([executable])
             deadline = time.time() + 5
             while time.time() < deadline:
                 created = [window for window in self.observer() if window["handle"] not in before]
-                if created:
-                    evidence = created[0]
+                launcher_pid = getattr(process, "pid", None)
+                owned = [window for window in created if window.get("pid") == launcher_pid
+                         or self.parent_pid(window.get("pid")) == launcher_pid]
+                if len(owned) == 1:
+                    evidence = owned[0]
                     self.owned[app["app_id"]] = evidence
                     return {"ok": True, "resource_id": "application.control.open", "resolved": app["app_id"], "evidence": evidence, "error": None}
                 time.sleep(0.1)
@@ -73,8 +89,8 @@ class Application:
         except OSError as exc:
             return {"ok": False, "resource_id": "application.control.open", "resolved": app["app_id"], "error": str(exc)}
 
-    def close(self, application: str, execute: bool = False) -> dict[str, Any]:
-        app = resolve(self.registry, application)
+    def close(self, application: str | dict[str, Any], execute: bool = False) -> dict[str, Any]:
+        app = application if isinstance(application, dict) else resolve(self.registry, application)
         if not app:
             return {"ok": False, "resource_id": "application.control.close", "error": "APPLICATION_UNSUPPORTED"}
         if not execute:

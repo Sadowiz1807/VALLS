@@ -1,6 +1,3 @@
-from .Application import Application
-from .Browser import Browser
-from .Media import Media
-from .System import System
+from .Dispatcher import ResourceDispatcher
 
-__all__ = ["Application", "Browser", "Media", "System"]
+__all__ = ["ResourceDispatcher"]

@@ -13,14 +13,14 @@ import re
 import shutil
 import subprocess
 import unicodedata
-import webbrowser
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Sequence
 
-from Runtime.Resources import Application, Browser, Media, System
-from Runtime.Skills import ApplicationControl, MediaControl, SystemControl, WebControl
+from Runtime.Providers.Builtin import build_builtin_providers
+from Runtime.Resources.Dispatcher import ResourceDispatcher
+from Runtime.Skills.Executor import SkillExecutor
 
 def normalize_text(text: str) -> str:
     if not text:
@@ -134,7 +134,8 @@ class ApplicationRegistry:
 
 class AgentHarness:
     """Agentic Execution Harness quản lý vòng lặp xử lý, memory và tool dispatching."""
-    def __init__(self, registry_dir: Path, execute: bool = False, runner: Any = None, web_opener: Any = None):
+    def __init__(self, registry_dir: Path, execute: bool = False, runner: Any = None,
+                 web_opener: Any = None, skill_executor: SkillExecutor | None = None):
         self.registry_dir = registry_dir
         self.app_registry = ApplicationRegistry(registry_dir / "applications.json")
         self.browser_registry = ApplicationRegistry(registry_dir / "browsers.json")
@@ -146,27 +147,11 @@ class AgentHarness:
         self.memory = DialogueMemory()
         self.execute = execute
         self.runner = runner or subprocess.Popen
-        self.web_opener = web_opener or webbrowser.open
-        application = Application(registry_dir / "applications.json", runner=self.runner)
-        web = Browser(registry_dir / "browsers.json", opener=self.web_opener, runner=self.runner)
-        media = Media(registry_dir / "media_providers.json")
-        system = System(registry_dir / "system.json")
-        application_skill = ApplicationControl(application)
-        web_skill = WebControl(web)
-        media_skill = MediaControl(media)
-        system_skill = SystemControl(system)
-        self.skill_handlers = {
-            "application.open": lambda args: application_skill.open(args.get("application", ""), self.execute),
-            "application.close": lambda args: application_skill.close(args.get("application", ""), self.execute),
-            "web.open": lambda args: web_skill.open(args.get("url", ""), args.get("browser"), self.execute),
-            "web.close": lambda args: web_skill.close(args.get("title", ""), self.execute),
-            "media.play": lambda args: media_skill.play(args.get("query", ""), args.get("platform", "spotify"), self.execute),
-            "media.transport": lambda args: media_skill.transport(args.get("action", ""), args.get("platform", "spotify"), self.execute),
-            "system.power": lambda args: system_skill.power(args.get("action", ""), self.execute),
-            "system.brightness": lambda args: system_skill.brightness(args.get("value"), self.execute),
-            "system.volume": lambda args: system_skill.volume(args.get("value"), self.execute),
-            "system.night_light": lambda args: system_skill.night_light(args.get("enabled"), self.execute),
-        }
+        providers = build_builtin_providers(registry_dir, self.runner, web_opener) if skill_executor is None else None
+        self.skill_executor = skill_executor or SkillExecutor(
+            self.skills_path,
+            ResourceDispatcher(providers, registry_dir / "resources.json"),
+        )
 
     def step(self, raw_input: str, vsad_model: Any) -> Dict[str, Any]:
         """Thực hiện một bước agentic: nạp context -> infer model -> dispatch tool -> update state & memory."""
@@ -205,7 +190,7 @@ class AgentHarness:
                 return {"status": "EXPIRED", "reason": "CONFIRMATION_EXPIRED", "response": "Yêu cầu trước đó đã hết hạn xác nhận."}
             target_frame = self.pending_frame
             self.pending_frame = None
-            exec_result = self._execute_skill(target_frame.skill_id, target_frame.arguments)
+            exec_result = self._execute_skill(target_frame.skill_id, target_frame.arguments, confirmed=True)
             return {
                 "status": "EXECUTED" if exec_result["ok"] else "ERROR",
                 "skill_id": target_frame.skill_id, "result": exec_result,
@@ -221,13 +206,15 @@ class AgentHarness:
 
         if act == "RESPOND":
             intent = params.get("intent", "GREETING")
+            result = self._execute_skill("conversation.social", {"intent": intent})
             responses = {
                 "GREETING": "Xin chào! Tôi có thể giúp gì cho bạn hôm nay?",
                 "THANKS": "Không có chi, rất vui được hỗ trợ bạn!",
                 "GOODBYE": "Tạm biệt bạn, hẹn gặp lại!",
                 "ACKNOWLEDGEMENT": "Tôi đã hiểu."
             }
-            return {"status": "RESPONDED", "response": responses.get(intent, "Tôi đã ghi nhận.")}
+            return {"status": "RESPONDED" if result.get("ok") else "ERROR", "result": result,
+                    "response": responses.get(intent, "Tôi đã ghi nhận.") if result.get("ok") else f"Không thể phản hồi: {result.get('error')}."}
 
         if act in ("UNSUPPORTED", None):
             return {"status": "UNSUPPORTED", "response": "Xin lỗi, tôi chưa hỗ trợ yêu cầu này."}
@@ -249,6 +236,9 @@ class AgentHarness:
         return {"status": "INVALID_FRAME", "response": "Không thể xử lý định dạng yêu cầu."}
 
     def _handle_execute(self, raw_input: str, goal: Optional[str], params: Dict[str, Any]) -> Dict[str, Any]:
+        params = dict(params)
+        if isinstance(params.get("action"), str):
+            params["action"] = params["action"].upper()
         if goal in ("APPLICATION_CONTROL", "WEB_OPEN"):
             action = params.get("action", "OPEN")
             raw_app = params.get("target" if goal == "WEB_OPEN" else "application", "")
@@ -366,46 +356,8 @@ class AgentHarness:
 
         return {"status": "UNSUPPORTED", "response": f"Chưa hỗ trợ tác vụ {goal}."}
 
-    def _dispatch_route(self, route: str, app: Dict[str, Any], browser: Optional[str]) -> Dict[str, Any]:
-        target = self.app_registry._local_executable(app) if route == "LOCAL" else self.app_registry._web_url(app)
-        result = {"route": route, "target": target, "started": False, "error": None}
-        if not self.execute:
-            return {**result, "dry_run": True}
-        try:
-            if route == "LOCAL":
-                self.runner([target])
-            elif browser:
-                resolved, _ = self.browser_registry.resolve(browser)
-                executable = self.browser_registry._local_executable(resolved or {})
-                executable = shutil.which(executable) if executable else None
-                if not executable:
-                    raise RuntimeError("BROWSER_NOT_FOUND")
-                self.runner([executable, target])
-            elif not self.web_opener(target):
-                raise RuntimeError("WEB_OPEN_FAILED")
-            result["started"] = True
-        except (OSError, RuntimeError) as exc:
-            result["error"] = str(exc)
-        return result
-
-    @staticmethod
-    def _dispatch_response(app_name: str, result: Dict[str, Any]) -> str:
-        if result["started"]:
-            return f"Đã mở {app_name}."
-        if result["error"]:
-            return f"Không thể mở {app_name}: {result['error']}."
-        return f"Dry-run: sẵn sàng mở {app_name} qua {result['route']}."
-
-    def _execute_skill(self, skill_id: str, args: Dict[str, Any]) -> Dict[str, Any]:
-        skill = next((item for item in self.skills if item.get("skill_id") == skill_id), None)
-        if not skill:
-            return {"ok": False, "skill_id": skill_id, "error": "SKILL_NOT_FOUND"}
-        if not skill.get("enabled", True):
-            return {"ok": False, "skill_id": skill_id, "error": "SKILL_DISABLED"}
-        handler = self.skill_handlers.get(skill_id)
-        if not handler:
-            return {"ok": False, "skill_id": skill_id, "error": "SKILL_NOT_IMPLEMENTED"}
-        return handler(args)
+    def _execute_skill(self, skill_id: str, args: Dict[str, Any], confirmed: bool = False) -> Dict[str, Any]:
+        return self.skill_executor.execute(skill_id, args, self.execute, confirmed=confirmed)
 
 
 # Alias for backward compatibility

@@ -1,0 +1,72 @@
+[
+  {
+    "provider_id": "application.catalog.builtin",
+    "enabled": true,
+    "priority": 10,
+    "capabilities": ["application.catalog.resolve"]
+  },
+  {
+    "provider_id": "application.control.windows",
+    "enabled": true,
+    "priority": 10,
+    "capabilities": [
+      "application.control.open",
+      "application.control.close"
+    ]
+  },
+  {
+    "provider_id": "browser.navigation.windows",
+    "enabled": true,
+    "priority": 10,
+    "capabilities": ["browser.navigation.open"]
+  },
+  {
+    "provider_id": "browser.window.windows",
+    "enabled": true,
+    "priority": 10,
+    "capabilities": ["browser.window.close"]
+  },
+  {
+    "provider_id": "media.spotify",
+    "enabled": true,
+    "priority": 10,
+    "capabilities": [
+      "media.playback.play",
+      "media.playback.pause",
+      "media.playback.resume",
+      "media.playback.stop",
+      "media.playback.next",
+      "media.playback.previous"
+    ]
+  },
+  {
+    "provider_id": "system.power.windows",
+    "enabled": true,
+    "priority": 10,
+    "capabilities": ["system.power"]
+  },
+  {
+    "provider_id": "system.brightness.windows",
+    "enabled": true,
+    "priority": 10,
+    "capabilities": ["system.brightness.set"]
+  },
+  {
+    "provider_id": "system.volume.windows",
+    "enabled": true,
+    "priority": 10,
+    "capabilities": ["system.volume.set"]
+  },
+  {
+    "provider_id": "system.night-light.windows",
+    "enabled": true,
+    "priority": 10,
+    "capabilities": ["system.night_light.set"]
+  },
+  {
+    "provider_id": "response.builtin",
+    "enabled": true,
+    "priority": 10,
+    "capabilities": ["response.renderer.social"]
+  }
+]

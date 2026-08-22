@@ -1,0 +1,98 @@
+[
+  {
+    "resource_id": "application.catalog.resolve",
+    "enabled": true,
+    "domain": "application",
+    "risk": "LOW"
+  },
+  {
+    "resource_id": "application.control.close",
+    "enabled": true,
+    "domain": "application",
+    "risk": "MEDIUM"
+  },
+  {
+    "resource_id": "application.control.open",
+    "enabled": true,
+    "domain": "application",
+    "risk": "LOW"
+  },
+  {
+    "resource_id": "browser.navigation.open",
+    "enabled": true,
+    "domain": "browser",
+    "risk": "LOW"
+  },
+  {
+    "resource_id": "browser.window.close",
+    "enabled": true,
+    "domain": "browser",
+    "risk": "MEDIUM"
+  },
+  {
+    "resource_id": "media.playback.next",
+    "enabled": true,
+    "domain": "media",
+    "risk": "LOW"
+  },
+  {
+    "resource_id": "media.playback.pause",
+    "enabled": true,
+    "domain": "media",
+    "risk": "LOW"
+  },
+  {
+    "resource_id": "media.playback.play",
+    "enabled": true,
+    "domain": "media",
+    "risk": "LOW"
+  },
+  {
+    "resource_id": "media.playback.previous",
+    "enabled": true,
+    "domain": "media",
+    "risk": "LOW"
+  },
+  {
+    "resource_id": "media.playback.resume",
+    "enabled": true,
+    "domain": "media",
+    "risk": "LOW"
+  },
+  {
+    "resource_id": "media.playback.stop",
+    "enabled": true,
+    "domain": "media",
+    "risk": "LOW"
+  },
+  {
+    "resource_id": "response.renderer.social",
+    "enabled": true,
+    "domain": "response",
+    "risk": "NONE"
+  },
+  {
+    "resource_id": "system.brightness.set",
+    "enabled": true,
+    "domain": "system",
+    "risk": "LOW"
+  },
+  {
+    "resource_id": "system.night_light.set",
+    "enabled": true,
+    "domain": "system",
+    "risk": "LOW"
+  },
+  {
+    "resource_id": "system.power",
+    "enabled": true,
+    "domain": "system",
+    "risk": "DYNAMIC"
+  },
+  {
+    "resource_id": "system.volume.set",
+    "enabled": true,
+    "domain": "system",
+    "risk": "LOW"
+  }
+]

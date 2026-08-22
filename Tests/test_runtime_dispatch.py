@@ -6,12 +6,12 @@ from Runtime.engine import AgentHarness
 
 
 def test_browser_close_window_matches_title_without_killing_process(monkeypatch):
-    module = importlib.import_module("Runtime.Resources.Browser")
+    module = importlib.import_module("Runtime.Providers.Browser")
     closed = []
     monkeypatch.setattr(module, "enum_windows", lambda: [(10, "YouTube - Cốc Cốc"), (11, "Facebook - Chrome")])
     monkeypatch.setattr(module, "close_tabs", lambda handle, title: closed.append((handle, title)) or 2)
 
-    result = module.Browser.close_title("youtube", execute=True)
+    result = module.BrowserProvider.close_title("youtube", execute=True)
 
     assert result["ok"] is True
     assert result["evidence"]["closed_tabs"] == 2
@@ -33,9 +33,32 @@ def registry(tmp_path: Path) -> Path:
         "executable": "chrome.exe",
         "enabled": True,
     }]), encoding="utf-8")
+    resources = {
+        "application.open": ["application.catalog.resolve", "application.control.open"],
+        "application.close": ["application.catalog.resolve", "application.control.close"],
+        "web.open": ["browser.navigation.open"],
+        "media.play": ["media.playback.play"],
+        "media.transport": ["media.playback.pause", "media.playback.resume", "media.playback.stop", "media.playback.next", "media.playback.previous"],
+    }
     (tmp_path / "skills.json").write_text(json.dumps([
-        {"skill_id": skill_id, "enabled": True}
-        for skill_id in ("application.open", "application.close", "web.open", "media.play", "media.transport")
+        {"skill_id": skill_id, "enabled": True, "resources": resource_ids}
+        for skill_id, resource_ids in resources.items()
+    ]), encoding="utf-8")
+    resource_ids = sorted({resource_id for ids in resources.values() for resource_id in ids})
+    (tmp_path / "resources.json").write_text(json.dumps([
+        {"resource_id": resource_id, "enabled": True} for resource_id in resource_ids
+    ]), encoding="utf-8")
+    (tmp_path / "providers.json").write_text(json.dumps([
+        {"provider_id": "application.catalog.builtin", "enabled": True, "priority": 10,
+         "capabilities": [resource_id for resource_id in resource_ids if resource_id == "application.catalog.resolve"]},
+        {"provider_id": "application.control.windows", "enabled": True, "priority": 10,
+         "capabilities": [resource_id for resource_id in resource_ids if resource_id.startswith("application.control.")]},
+        {"provider_id": "browser.navigation.windows", "enabled": True, "priority": 10,
+         "capabilities": [resource_id for resource_id in resource_ids if resource_id == "browser.navigation.open"]},
+        {"provider_id": "browser.window.windows", "enabled": True, "priority": 10,
+         "capabilities": [resource_id for resource_id in resource_ids if resource_id == "browser.window.close"]},
+        {"provider_id": "media.spotify", "enabled": True, "priority": 10,
+         "capabilities": [resource_id for resource_id in resource_ids if resource_id.startswith("media.")]},
     ]), encoding="utf-8")
     return tmp_path
 
@@ -48,11 +71,29 @@ def frame(**parameters):
     return {"act": "EXECUTE", "goal": "APPLICATION_CONTROL", "parameters": {"action": "OPEN", "application": "spotify", **parameters}}
 
 
+def test_harness_normalizes_lowercase_action_before_routing(tmp_path):
+    executor = type("Executor", (), {
+        "execute": lambda self, skill_id, args, execute, confirmed=False: {
+            "ok": True, "skill_id": skill_id, "arguments": args,
+        }
+    })()
+    harness = AgentHarness(registry(tmp_path), skill_executor=executor)
+
+    opened = harness._dispatch_turn("mở spotify", frame(action="open"))
+    played = harness._dispatch_turn("phát nhạc", {
+        "act": "EXECUTE", "goal": "MEDIA_CONTROL",
+        "parameters": {"action": "play", "query": "One More Time"},
+    })
+
+    assert opened["status"] == "EXECUTED"
+    assert played["skill_id"] == "media.play"
+
+
 def test_local_dispatch_reports_started_process(monkeypatch, tmp_path):
     calls = []
     snapshots = iter([[], [{"handle": 7, "pid": 42, "title": "Spotify"}]])
     monkeypatch.setattr("Runtime.engine.shutil.which", lambda executable: executable)
-    application_module = importlib.import_module("Runtime.Resources.Application")
+    application_module = importlib.import_module("Runtime.Providers.Application")
     monkeypatch.setattr(application_module, "observe_windows", lambda: next(snapshots))
     harness = AgentHarness(registry(tmp_path), execute=True, runner=lambda argv: calls.append(argv) or Process())
 
