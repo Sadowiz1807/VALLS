@@ -1,300 +1,359 @@
-[
-  {
-    "skill_id": "application.open",
-    "description": "Resolve và mở ứng dụng local",
-    "accepts": {
-      "act": [
-        "EXECUTE"
-      ],
-      "goal": "APPLICATION_CONTROL",
-      "action": "OPEN"
-    },
-    "inputs": {
-      "application": {
-        "type": "string",
-        "required": true
-      }
-    },
-    "resources": [
-      "application.catalog.resolve",
-      "application.control.open"
-    ],
-    "risk": "LOW",
-    "confirmation_required": false,
-    "steps": [
-      "application.catalog.resolve",
-      "application.control.open"
-    ]
-  },
-  {
-    "skill_id": "application.close",
-    "description": "Resolve và đóng ứng dụng local",
-    "accepts": {
-      "act": [
-        "EXECUTE"
-      ],
-      "goal": "APPLICATION_CONTROL",
-      "action": "CLOSE"
-    },
-    "inputs": {
-      "application": {
-        "type": "string",
-        "required": true
-      }
-    },
-    "resources": [
-      "application.catalog.resolve",
-      "application.control.close"
-    ],
-    "risk": "MEDIUM",
-    "confirmation_required": true,
-    "steps": [
-      "application.catalog.resolve",
-      "application.control.close"
-    ]
-  },
-  {
-    "skill_id": "web.open",
-    "description": "Mở URL bằng browser whitelist",
-    "accepts": {
-      "act": [
-        "EXECUTE"
-      ],
-      "goal": "WEB_OPEN"
-    },
-    "inputs": {
-      "url": {
-        "type": "string",
-        "required": true
+{
+  "schema_version": "1.0",
+  "ontology_contract_version": "2.0",
+  "ontology_release_version": "0.0.4",
+  "items": [
+    {
+      "skill_id": "application.open",
+      "description": "Resolve và mở ứng dụng local",
+      "accepts": {
+        "act": [
+          "EXECUTE"
+        ],
+        "goal": "APPLICATION_CONTROL",
+        "action": "OPEN"
       },
-      "browser": {
-        "type": "string",
-        "required": false
-      }
-    },
-    "resources": [
-      "browser.navigation.open"
-    ],
-    "risk": "LOW",
-    "confirmation_required": false,
-    "enabled": true
-  },
-  {
-    "skill_id": "web.close",
-    "description": "Đóng đúng cửa sổ web theo title whitelist",
-    "enabled": true,
-    "accepts": {
-      "act": [
-        "EXECUTE"
-      ],
-      "goal": "APPLICATION_CONTROL",
-      "action": "CLOSE"
-    },
-    "inputs": {
-      "title": {
-        "type": "string",
-        "required": true
-      }
-    },
-    "resources": [
-      "browser.window.close"
-    ],
-    "risk": "MEDIUM",
-    "confirmation_required": false
-  },
-  {
-    "skill_id": "media.play",
-    "description": "Phát nội dung media",
-    "accepts": {
-      "act": [
-        "EXECUTE"
-      ],
-      "goal": "MEDIA_CONTROL",
-      "action": "PLAY"
-    },
-    "inputs": {
-      "query": {
-        "type": "string",
-        "required": true
+      "inputs": {
+        "application": {
+          "type": "string",
+          "required": true
+        }
       },
-      "platform": {
-        "type": "string",
-        "required": false
-      }
-    },
-    "resources": [
-      "media.playback.play"
-    ],
-    "risk": "LOW",
-    "confirmation_required": false
-  },
-  {
-    "skill_id": "media.transport",
-    "description": "Điều khiển playback media",
-    "accepts": {
-      "act": [
-        "EXECUTE"
+      "resources": [
+        "application.catalog.resolve",
+        "application.control.open"
       ],
-      "goal": "MEDIA_CONTROL",
-      "action": [
-        "PAUSE",
-        "RESUME",
-        "STOP",
-        "NEXT",
-        "PREVIOUS"
+      "risk": "LOW",
+      "confirmation_required": false,
+      "steps": [
+        {
+          "id": "resolve_application",
+          "use": "application.catalog.resolve",
+          "with": {
+            "query": "$inputs.application"
+          }
+        },
+        {
+          "id": "open_application",
+          "use": "application.control.open",
+          "with": {
+            "entity": "$steps.resolve_application.result.entity"
+          }
+        }
       ]
     },
-    "inputs": {
-      "action": {
-        "type": "string",
-        "required": true
+    {
+      "skill_id": "application.close",
+      "description": "Resolve và đóng ứng dụng local",
+      "accepts": {
+        "act": [
+          "EXECUTE"
+        ],
+        "goal": "APPLICATION_CONTROL",
+        "action": "CLOSE"
       },
-      "platform": {
-        "type": "string",
-        "required": false
-      }
-    },
-    "resources": [
-      "media.playback.pause",
-      "media.playback.resume",
-      "media.playback.stop",
-      "media.playback.next",
-      "media.playback.previous"
-    ],
-    "risk": "LOW",
-    "confirmation_required": false,
-    "enabled": true
-  },
-  {
-    "skill_id": "conversation.social",
-    "description": "Phản hồi xã hội (chào hỏi, cảm ơn)",
-    "accepts": {
-      "act": [
-        "RESPOND"
+      "inputs": {
+        "application": {
+          "type": "string",
+          "required": true
+        }
+      },
+      "resources": [
+        "application.catalog.resolve",
+        "application.control.close"
       ],
-      "goal": "SOCIAL_RESPONSE"
-    },
-    "inputs": {
-      "intent": {
-        "type": "string",
-        "required": true
-      }
-    },
-    "resources": [
-      "response.renderer.social"
-    ],
-    "risk": "NONE",
-    "confirmation_required": false
-  },
-  {
-    "skill_id": "system.power",
-    "description": "Shutdown, restart hoặc sleep thiết bị",
-    "enabled": true,
-    "accepts": {
-      "act": [
-        "EXECUTE"
-      ],
-      "goal": "SYSTEM_CONTROL",
-      "action": [
-        "SHUTDOWN",
-        "RESTART",
-        "SLEEP"
+      "risk": "MEDIUM",
+      "confirmation_required": true,
+      "steps": [
+        {
+          "id": "resolve_application",
+          "use": "application.catalog.resolve",
+          "with": {
+            "query": "$inputs.application"
+          }
+        },
+        {
+          "id": "close_application",
+          "use": "application.control.close",
+          "with": {
+            "entity": "$steps.resolve_application.result.entity"
+          }
+        }
       ]
     },
-    "inputs": {
-      "action": {
-        "type": "string",
-        "required": true
+    {
+      "skill_id": "web.open",
+      "description": "Mở URL bằng browser whitelist",
+      "accepts": {
+        "act": [
+          "EXECUTE"
+        ],
+        "goal": "WEB_OPEN"
+      },
+      "inputs": {
+        "target": {
+          "type": "string",
+          "required": true
+        },
+        "browser": {
+          "type": "string",
+          "required": false
+        }
+      },
+      "resources": [
+        "application.catalog.resolve",
+        "browser.navigation.open"
+      ],
+      "risk": "LOW",
+      "confirmation_required": false,
+      "enabled": true,
+      "steps": [
+        {
+          "id": "resolve_target",
+          "use": "application.catalog.resolve",
+          "with": {
+            "query": "$inputs.target"
+          }
+        },
+        {
+          "id": "open_url",
+          "use": "browser.navigation.open",
+          "with": {
+            "url": "$steps.resolve_target.result.web_url",
+            "browser": "$inputs.browser"
+          }
+        }
+      ]
+    },
+    {
+      "skill_id": "web.close",
+      "description": "Đóng đúng cửa sổ web theo title whitelist",
+      "enabled": true,
+      "accepts": {
+        "act": [
+          "EXECUTE"
+        ],
+        "goal": "APPLICATION_CONTROL",
+        "action": "CLOSE"
+      },
+      "inputs": {
+        "title": {
+          "type": "string",
+          "required": true
+        }
+      },
+      "resources": [
+        "browser.window.close"
+      ],
+      "risk": "MEDIUM",
+      "confirmation_required": false,
+      "semantically_reachable": false
+    },
+    {
+      "skill_id": "media.play",
+      "description": "Phát nội dung media",
+      "accepts": {
+        "act": [
+          "EXECUTE"
+        ],
+        "goal": "MEDIA_CONTROL",
+        "action": "PLAY"
+      },
+      "inputs": {
+        "query": {
+          "type": "string",
+          "required": true
+        },
+        "platform": {
+          "type": "string",
+          "required": false
+        }
+      },
+      "resources": [
+        "media.playback.play"
+      ],
+      "risk": "LOW",
+      "confirmation_required": false
+    },
+    {
+      "skill_id": "media.transport",
+      "description": "Điều khiển playback media",
+      "accepts": {
+        "act": [
+          "EXECUTE"
+        ],
+        "goal": "MEDIA_CONTROL",
+        "action": [
+          "PAUSE",
+          "RESUME",
+          "STOP",
+          "NEXT",
+          "PREVIOUS"
+        ]
+      },
+      "inputs": {
+        "action": {
+          "type": "string",
+          "required": true
+        },
+        "platform": {
+          "type": "string",
+          "required": false
+        }
+      },
+      "resources": [
+        "media.playback.pause",
+        "media.playback.resume",
+        "media.playback.stop",
+        "media.playback.next",
+        "media.playback.previous"
+      ],
+      "risk": "LOW",
+      "confirmation_required": false,
+      "enabled": true,
+      "resource_by_action": {
+        "PAUSE": "media.playback.pause",
+        "RESUME": "media.playback.resume",
+        "STOP": "media.playback.stop",
+        "NEXT": "media.playback.next",
+        "PREVIOUS": "media.playback.previous"
       }
     },
-    "resources": [
-      "system.power"
-    ],
-    "risk_by_action": {
-      "SHUTDOWN": "HIGH",
-      "RESTART": "HIGH",
-      "SLEEP": "MEDIUM"
+    {
+      "skill_id": "conversation.social",
+      "description": "Phản hồi xã hội (chào hỏi, cảm ơn)",
+      "accepts": {
+        "act": [
+          "RESPOND"
+        ],
+        "goal": "SOCIAL_RESPONSE"
+      },
+      "inputs": {
+        "intent": {
+          "type": "string",
+          "required": true
+        }
+      },
+      "resources": [
+        "response.renderer.social"
+      ],
+      "risk": "NONE",
+      "confirmation_required": false
     },
-    "confirmation_required_by_action": {
-      "SHUTDOWN": true,
-      "RESTART": true,
-      "SLEEP": false
+    {
+      "skill_id": "system.power",
+      "description": "Shutdown, restart hoặc sleep thiết bị",
+      "enabled": true,
+      "accepts": {
+        "act": [
+          "EXECUTE"
+        ],
+        "goal": "SYSTEM_CONTROL",
+        "action": [
+          "SHUTDOWN",
+          "RESTART",
+          "SLEEP"
+        ]
+      },
+      "inputs": {
+        "action": {
+          "type": "string",
+          "required": true
+        }
+      },
+      "resources": [
+        "system.power"
+      ],
+      "risk_by_action": {
+        "SHUTDOWN": "HIGH",
+        "RESTART": "HIGH",
+        "SLEEP": "MEDIUM"
+      },
+      "confirmation_required_by_action": {
+        "SHUTDOWN": true,
+        "RESTART": true,
+        "SLEEP": false
+      },
+      "semantically_reachable": false
+    },
+    {
+      "skill_id": "system.brightness",
+      "description": "Đặt độ sáng màn hình theo phần trăm",
+      "enabled": true,
+      "accepts": {
+        "act": [
+          "EXECUTE"
+        ],
+        "goal": "SYSTEM_CONTROL",
+        "action": "SET_BRIGHTNESS"
+      },
+      "inputs": {
+        "value": {
+          "type": "integer",
+          "required": true,
+          "minimum": 0,
+          "maximum": 100
+        }
+      },
+      "resources": [
+        "system.brightness.set"
+      ],
+      "risk": "LOW",
+      "confirmation_required": false,
+      "semantically_reachable": false
+    },
+    {
+      "skill_id": "system.volume",
+      "description": "Đặt âm lượng hệ thống theo phần trăm",
+      "enabled": true,
+      "accepts": {
+        "act": [
+          "EXECUTE"
+        ],
+        "goal": "SYSTEM_CONTROL",
+        "action": "SET_VOLUME"
+      },
+      "inputs": {
+        "value": {
+          "type": "integer",
+          "required": true,
+          "minimum": 0,
+          "maximum": 100
+        }
+      },
+      "resources": [
+        "system.volume.set"
+      ],
+      "risk": "LOW",
+      "confirmation_required": false,
+      "semantically_reachable": false
+    },
+    {
+      "skill_id": "system.night_light",
+      "description": "Bật hoặc tắt Windows Night Light",
+      "enabled": true,
+      "accepts": {
+        "act": [
+          "EXECUTE"
+        ],
+        "goal": "SYSTEM_CONTROL",
+        "action": [
+          "NIGHT_LIGHT_ON",
+          "NIGHT_LIGHT_OFF"
+        ]
+      },
+      "inputs": {
+        "enabled": {
+          "type": "boolean",
+          "required": true
+        }
+      },
+      "resources": [
+        "system.night_light.set"
+      ],
+      "risk": "LOW",
+      "confirmation_required": false,
+      "semantically_reachable": false
     }
-  },
-  {
-    "skill_id": "system.brightness",
-    "description": "Đặt độ sáng màn hình theo phần trăm",
-    "enabled": true,
-    "accepts": {
-      "act": [
-        "EXECUTE"
-      ],
-      "goal": "SYSTEM_CONTROL",
-      "action": "SET_BRIGHTNESS"
-    },
-    "inputs": {
-      "value": {
-        "type": "integer",
-        "required": true,
-        "minimum": 0,
-        "maximum": 100
-      }
-    },
-    "resources": [
-      "system.brightness.set"
-    ],
-    "risk": "LOW",
-    "confirmation_required": false
-  },
-  {
-    "skill_id": "system.volume",
-    "description": "Đặt âm lượng hệ thống theo phần trăm",
-    "enabled": true,
-    "accepts": {
-      "act": [
-        "EXECUTE"
-      ],
-      "goal": "SYSTEM_CONTROL",
-      "action": "SET_VOLUME"
-    },
-    "inputs": {
-      "value": {
-        "type": "integer",
-        "required": true,
-        "minimum": 0,
-        "maximum": 100
-      }
-    },
-    "resources": [
-      "system.volume.set"
-    ],
-    "risk": "LOW",
-    "confirmation_required": false
-  },
-  {
-    "skill_id": "system.night_light",
-    "description": "Bật hoặc tắt Windows Night Light",
-    "enabled": true,
-    "accepts": {
-      "act": [
-        "EXECUTE"
-      ],
-      "goal": "SYSTEM_CONTROL",
-      "action": [
-        "NIGHT_LIGHT_ON",
-        "NIGHT_LIGHT_OFF"
-      ]
-    },
-    "inputs": {
-      "enabled": {
-        "type": "boolean",
-        "required": true
-      }
-    },
-    "resources": [
-      "system.night_light.set"
-    ],
-    "risk": "LOW",
-    "confirmation_required": false
-  }
-]
+  ]
+}

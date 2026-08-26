@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 
+from Runtime.Providers import Builtin
 from Runtime.Providers.Application import ApplicationProvider
 from Runtime.Providers.Browser import BrowserProvider
 from Runtime.Providers.Media import MediaProvider
@@ -15,10 +16,27 @@ class FakeSkillExecutor:
         self.responses = responses or {}
         self.calls = []
 
-    def execute(self, skill_id, args, execute, confirmed=False):
-        self.calls.append((skill_id, args, execute, confirmed))
+    def execute(self, skill_id, args, execute, confirmation_grant=None):
+        self.calls.append((skill_id, args, execute, confirmation_grant))
+        if skill_id == "application.close" and execute and confirmation_grant is None:
+            return {
+                "skill_id": skill_id, "ok": False, "error": "CONFIRMATION_REQUIRED",
+                "request_id": "request-1", "resource_id": "application.control.close",
+                "effective_risk": "MEDIUM",
+            }
         response = self.responses.get(skill_id, {"ok": True, "evidence": {"called": True}})
         return {"skill_id": skill_id, **response}
+
+
+def test_application_provider_does_not_require_psutil(monkeypatch):
+    monkeypatch.setattr(Builtin.os, "name", "nt")
+    monkeypatch.setattr(
+        Builtin.importlib.util,
+        "find_spec",
+        lambda name: object() if name in {"win32gui", "win32process"} else None,
+    )
+
+    assert Builtin._dependency_available("application.windows") is True
 
 
 def write_registry(path: Path):
@@ -221,7 +239,9 @@ def test_application_close_requires_confirmation(tmp_path):
     confirmed = harness._dispatch_turn("đồng ý", {"act": "CONFIRM", "goal": "APPLICATION_CONTROL", "parameters": {}})
 
     assert pending["status"] == "AWAITING_CONFIRMATION"
-    assert executor.calls == [("application.close", {"application": "notepad"}, True, True)]
+    assert executor.calls[0][:3] == ("application.close", {"application": "notepad"}, True)
+    assert executor.calls[0][3] is None
+    assert executor.calls[1][3] is not None
     assert confirmed["status"] == "EXECUTED" and confirmed["result"]["ok"] is True
 
 
@@ -249,7 +269,7 @@ def test_sleep_unimplemented_never_returns_executed(tmp_path):
     })
 
     assert result["status"] == "ERROR"
-    assert result["result"]["error"] == "SKILL_NOT_IMPLEMENTED"
+    assert result["error"] == "SKILL_NOT_AVAILABLE"
 
 
 def test_harness_unknown_skill_never_returns_success(tmp_path):
@@ -265,8 +285,10 @@ def test_harness_dispatches_all_five_registered_skills(tmp_path):
     executor = FakeSkillExecutor()
     harness = AgentHarness(tmp_path, execute=True, skill_executor=executor)
 
-    skill_ids = ("application.open", "application.close", "web.open", "media.play", "media.transport")
+    skill_ids = ("application.open", "web.open", "media.play", "media.transport")
     for skill_id in skill_ids:
         assert harness._execute_skill(skill_id, {"value": 1})["ok"] is True
 
-    assert [skill_id for skill_id, _, _, _ in executor.calls] == list(skill_ids)
+    close = harness._execute_skill("application.close", {"value": 1})
+    assert close["error"] == "CONFIRMATION_REQUIRED"
+    assert [skill_id for skill_id, _, _, _ in executor.calls] == [*skill_ids, "application.close"]

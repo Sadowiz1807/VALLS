@@ -1,98 +1,487 @@
-[
-  {
-    "resource_id": "application.catalog.resolve",
-    "enabled": true,
-    "domain": "application",
-    "risk": "LOW"
-  },
-  {
-    "resource_id": "application.control.close",
-    "enabled": true,
-    "domain": "application",
-    "risk": "MEDIUM"
-  },
-  {
-    "resource_id": "application.control.open",
-    "enabled": true,
-    "domain": "application",
-    "risk": "LOW"
-  },
-  {
-    "resource_id": "browser.navigation.open",
-    "enabled": true,
-    "domain": "browser",
-    "risk": "LOW"
-  },
-  {
-    "resource_id": "browser.window.close",
-    "enabled": true,
-    "domain": "browser",
-    "risk": "MEDIUM"
-  },
-  {
-    "resource_id": "media.playback.next",
-    "enabled": true,
-    "domain": "media",
-    "risk": "LOW"
-  },
-  {
-    "resource_id": "media.playback.pause",
-    "enabled": true,
-    "domain": "media",
-    "risk": "LOW"
-  },
-  {
-    "resource_id": "media.playback.play",
-    "enabled": true,
-    "domain": "media",
-    "risk": "LOW"
-  },
-  {
-    "resource_id": "media.playback.previous",
-    "enabled": true,
-    "domain": "media",
-    "risk": "LOW"
-  },
-  {
-    "resource_id": "media.playback.resume",
-    "enabled": true,
-    "domain": "media",
-    "risk": "LOW"
-  },
-  {
-    "resource_id": "media.playback.stop",
-    "enabled": true,
-    "domain": "media",
-    "risk": "LOW"
-  },
-  {
-    "resource_id": "response.renderer.social",
-    "enabled": true,
-    "domain": "response",
-    "risk": "NONE"
-  },
-  {
-    "resource_id": "system.brightness.set",
-    "enabled": true,
-    "domain": "system",
-    "risk": "LOW"
-  },
-  {
-    "resource_id": "system.night_light.set",
-    "enabled": true,
-    "domain": "system",
-    "risk": "LOW"
-  },
-  {
-    "resource_id": "system.power",
-    "enabled": true,
-    "domain": "system",
-    "risk": "DYNAMIC"
-  },
-  {
-    "resource_id": "system.volume.set",
-    "enabled": true,
-    "domain": "system",
-    "risk": "LOW"
-  }
-]
+{
+  "schema_version": "1.0",
+  "ontology_contract_version": "2.0",
+  "ontology_release_version": "0.0.4",
+  "items": [
+    {
+      "resource_id": "application.catalog.resolve",
+      "enabled": true,
+      "domain": "application",
+      "risk": "LOW",
+      "arguments": {
+        "query": {
+          "type": "string",
+          "required": true
+        }
+      },
+      "result": {
+        "ok": {
+          "type": "boolean",
+          "required": true
+        },
+        "application_id": {
+          "type": "string",
+          "required_on_success": true
+        },
+        "entity": {
+          "type": "object",
+          "required_on_success": true
+        },
+        "web_url": {
+          "type": "string",
+          "required": false
+        },
+        "error": {
+          "type": "string",
+          "required": false
+        }
+      },
+      "operation": "application.catalog.resolve"
+    },
+    {
+      "resource_id": "application.control.close",
+      "enabled": true,
+      "domain": "application",
+      "risk": "MEDIUM",
+      "arguments": {
+        "entity": {
+          "type": "object",
+          "required": true
+        }
+      },
+      "result": {
+        "ok": {
+          "type": "boolean",
+          "required": true
+        },
+        "evidence": {
+          "type": "object",
+          "required_on_success": true
+        },
+        "error": {
+          "type": "string",
+          "required": false
+        }
+      },
+      "operation": "application.control.close"
+    },
+    {
+      "resource_id": "application.control.open",
+      "enabled": true,
+      "domain": "application",
+      "risk": "LOW",
+      "arguments": {
+        "entity": {
+          "type": "object",
+          "required": true
+        }
+      },
+      "result": {
+        "ok": {
+          "type": "boolean",
+          "required": true
+        },
+        "evidence": {
+          "type": "object",
+          "required_on_success": true
+        },
+        "error": {
+          "type": "string",
+          "required": false
+        }
+      },
+      "operation": "application.control.open"
+    },
+    {
+      "resource_id": "browser.navigation.open",
+      "enabled": true,
+      "domain": "browser",
+      "risk": "LOW",
+      "arguments": {
+        "url": {
+          "type": "string",
+          "required": true
+        },
+        "browser": {
+          "type": "string",
+          "required": false
+        }
+      },
+      "result": {
+        "ok": {
+          "type": "boolean",
+          "required": true
+        },
+        "evidence": {
+          "type": "object",
+          "required_on_success": true
+        },
+        "error": {
+          "type": "string",
+          "required": false
+        }
+      },
+      "operation": "browser.navigation.open"
+    },
+    {
+      "resource_id": "browser.window.close",
+      "enabled": true,
+      "domain": "browser",
+      "risk": "MEDIUM",
+      "operation": "browser.window.close",
+      "arguments": {
+        "title": {
+          "type": "string",
+          "required": true
+        }
+      },
+      "result": {
+        "ok": {
+          "type": "boolean",
+          "required": true
+        },
+        "evidence": {
+          "type": "object",
+          "required_on_success": true
+        },
+        "error": {
+          "type": "string",
+          "required": false
+        }
+      }
+    },
+    {
+      "resource_id": "media.playback.next",
+      "enabled": true,
+      "domain": "media",
+      "risk": "LOW",
+      "operation": "media.playback.next",
+      "arguments": {
+        "platform": {
+          "type": "string",
+          "required": false
+        }
+      },
+      "result": {
+        "ok": {
+          "type": "boolean",
+          "required": true
+        },
+        "provider": {
+          "type": "string",
+          "required_on_success": true
+        },
+        "observed": {
+          "type": "object",
+          "required": false
+        },
+        "error": {
+          "type": "string",
+          "required": false
+        }
+      }
+    },
+    {
+      "resource_id": "media.playback.pause",
+      "enabled": true,
+      "domain": "media",
+      "risk": "LOW",
+      "operation": "media.playback.pause",
+      "arguments": {
+        "platform": {
+          "type": "string",
+          "required": false
+        }
+      },
+      "result": {
+        "ok": {
+          "type": "boolean",
+          "required": true
+        },
+        "provider": {
+          "type": "string",
+          "required_on_success": true
+        },
+        "observed": {
+          "type": "object",
+          "required": false
+        },
+        "error": {
+          "type": "string",
+          "required": false
+        }
+      }
+    },
+    {
+      "resource_id": "media.playback.play",
+      "enabled": true,
+      "domain": "media",
+      "risk": "LOW",
+      "operation": "media.playback.play",
+      "arguments": {
+        "platform": {
+          "type": "string",
+          "required": false
+        },
+        "query": {
+          "type": "string",
+          "required": false
+        }
+      },
+      "result": {
+        "ok": {
+          "type": "boolean",
+          "required": true
+        },
+        "provider": {
+          "type": "string",
+          "required_on_success": true
+        },
+        "observed": {
+          "type": "object",
+          "required": false
+        },
+        "error": {
+          "type": "string",
+          "required": false
+        }
+      }
+    },
+    {
+      "resource_id": "media.playback.previous",
+      "enabled": true,
+      "domain": "media",
+      "risk": "LOW",
+      "operation": "media.playback.previous",
+      "arguments": {
+        "platform": {
+          "type": "string",
+          "required": false
+        }
+      },
+      "result": {
+        "ok": {
+          "type": "boolean",
+          "required": true
+        },
+        "provider": {
+          "type": "string",
+          "required_on_success": true
+        },
+        "observed": {
+          "type": "object",
+          "required": false
+        },
+        "error": {
+          "type": "string",
+          "required": false
+        }
+      }
+    },
+    {
+      "resource_id": "media.playback.resume",
+      "enabled": true,
+      "domain": "media",
+      "risk": "LOW",
+      "operation": "media.playback.resume",
+      "arguments": {
+        "platform": {
+          "type": "string",
+          "required": false
+        }
+      },
+      "result": {
+        "ok": {
+          "type": "boolean",
+          "required": true
+        },
+        "provider": {
+          "type": "string",
+          "required_on_success": true
+        },
+        "observed": {
+          "type": "object",
+          "required": false
+        },
+        "error": {
+          "type": "string",
+          "required": false
+        }
+      }
+    },
+    {
+      "resource_id": "media.playback.stop",
+      "enabled": true,
+      "domain": "media",
+      "risk": "LOW",
+      "operation": "media.playback.stop",
+      "arguments": {
+        "platform": {
+          "type": "string",
+          "required": false
+        }
+      },
+      "result": {
+        "ok": {
+          "type": "boolean",
+          "required": true
+        },
+        "provider": {
+          "type": "string",
+          "required_on_success": true
+        },
+        "observed": {
+          "type": "object",
+          "required": false
+        },
+        "error": {
+          "type": "string",
+          "required": false
+        }
+      }
+    },
+    {
+      "resource_id": "response.renderer.social",
+      "enabled": true,
+      "domain": "response",
+      "risk": "NONE",
+      "operation": "response.renderer.social",
+      "arguments": {
+        "intent": {
+          "type": "string",
+          "required": true
+        }
+      },
+      "result": {
+        "ok": {
+          "type": "boolean",
+          "required": true
+        },
+        "evidence": {
+          "type": "object",
+          "required_on_success": true
+        },
+        "error": {
+          "type": "string",
+          "required": false
+        }
+      }
+    },
+    {
+      "resource_id": "system.brightness.set",
+      "enabled": true,
+      "domain": "system",
+      "risk": "LOW",
+      "operation": "system.brightness.set",
+      "arguments": {
+        "value": {
+          "type": "integer",
+          "required": true
+        }
+      },
+      "result": {
+        "ok": {
+          "type": "boolean",
+          "required": true
+        },
+        "evidence": {
+          "type": "object",
+          "required_on_success": true
+        },
+        "error": {
+          "type": "string",
+          "required": false
+        }
+      }
+    },
+    {
+      "resource_id": "system.night_light.set",
+      "enabled": true,
+      "domain": "system",
+      "risk": "LOW",
+      "operation": "system.night_light.set",
+      "arguments": {
+        "enabled": {
+          "type": "boolean",
+          "required": true
+        }
+      },
+      "result": {
+        "ok": {
+          "type": "boolean",
+          "required": true
+        },
+        "evidence": {
+          "type": "object",
+          "required_on_success": true
+        },
+        "error": {
+          "type": "string",
+          "required": false
+        }
+      }
+    },
+    {
+      "resource_id": "system.power",
+      "enabled": true,
+      "domain": "system",
+      "risk_by_action": {
+        "SLEEP": "MEDIUM",
+        "SHUTDOWN": "HIGH",
+        "RESTART": "HIGH"
+      },
+      "operation": "system.power",
+      "arguments": {
+        "action": {
+          "type": "string",
+          "required": true
+        }
+      },
+      "result": {
+        "ok": {
+          "type": "boolean",
+          "required": true
+        },
+        "action": {
+          "type": "string",
+          "required_on_success": true
+        },
+        "evidence": {
+          "type": "object",
+          "required_on_success": true
+        },
+        "error": {
+          "type": "string",
+          "required": false
+        }
+      }
+    },
+    {
+      "resource_id": "system.volume.set",
+      "enabled": true,
+      "domain": "system",
+      "risk": "LOW",
+      "operation": "system.volume.set",
+      "arguments": {
+        "value": {
+          "type": "integer",
+          "required": true
+        }
+      },
+      "result": {
+        "ok": {
+          "type": "boolean",
+          "required": true
+        },
+        "evidence": {
+          "type": "object",
+          "required_on_success": true
+        },
+        "error": {
+          "type": "string",
+          "required": false
+        }
+      }
+    }
+  ]
+}

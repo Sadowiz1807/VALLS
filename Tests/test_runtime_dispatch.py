@@ -1,5 +1,5 @@
-import json
 import importlib
+import json
 from pathlib import Path
 
 from Runtime.engine import AgentHarness
@@ -8,7 +8,7 @@ from Runtime.engine import AgentHarness
 def test_browser_close_window_matches_title_without_killing_process(monkeypatch):
     module = importlib.import_module("Runtime.Providers.Browser")
     closed = []
-    monkeypatch.setattr(module, "enum_windows", lambda: [(10, "YouTube - Cốc Cốc"), (11, "Facebook - Chrome")])
+    monkeypatch.setattr(module, "enum_windows", lambda: [(10, "YouTube - Coc Coc"), (11, "Facebook - Chrome")])
     monkeypatch.setattr(module, "close_tabs", lambda handle, title: closed.append((handle, title)) or 2)
 
     result = module.BrowserProvider.close_title("youtube", execute=True)
@@ -20,173 +20,159 @@ def test_browser_close_window_matches_title_without_killing_process(monkeypatch)
 
 def registry(tmp_path: Path) -> Path:
     (tmp_path / "applications.json").write_text(json.dumps([{
-        "app_id": "spotify",
-        "name": "Spotify",
-        "aliases": ["spotify"],
-        "enabled": True,
-        "local": {"executable": "spotify.exe"},
-        "web": {"url": "https://open.spotify.com"},
+        "app_id": "spotify", "name": "Spotify", "aliases": ["spotify"], "enabled": True,
+        "local": {"executable": "spotify.exe"}, "web": {"url": "https://open.spotify.com"},
     }]), encoding="utf-8")
-    (tmp_path / "browsers.json").write_text(json.dumps([{
-        "browser_id": "chrome",
-        "aliases": ["chrome"],
-        "executable": "chrome.exe",
-        "enabled": True,
-    }]), encoding="utf-8")
-    resources = {
-        "application.open": ["application.catalog.resolve", "application.control.open"],
-        "application.close": ["application.catalog.resolve", "application.control.close"],
-        "web.open": ["browser.navigation.open"],
-        "media.play": ["media.playback.play"],
-        "media.transport": ["media.playback.pause", "media.playback.resume", "media.playback.stop", "media.playback.next", "media.playback.previous"],
-    }
-    (tmp_path / "skills.json").write_text(json.dumps([
-        {"skill_id": skill_id, "enabled": True, "resources": resource_ids}
-        for skill_id, resource_ids in resources.items()
-    ]), encoding="utf-8")
-    resource_ids = sorted({resource_id for ids in resources.values() for resource_id in ids})
-    (tmp_path / "resources.json").write_text(json.dumps([
-        {"resource_id": resource_id, "enabled": True} for resource_id in resource_ids
-    ]), encoding="utf-8")
-    (tmp_path / "providers.json").write_text(json.dumps([
-        {"provider_id": "application.catalog.builtin", "enabled": True, "priority": 10,
-         "capabilities": [resource_id for resource_id in resource_ids if resource_id == "application.catalog.resolve"]},
-        {"provider_id": "application.control.windows", "enabled": True, "priority": 10,
-         "capabilities": [resource_id for resource_id in resource_ids if resource_id.startswith("application.control.")]},
-        {"provider_id": "browser.navigation.windows", "enabled": True, "priority": 10,
-         "capabilities": [resource_id for resource_id in resource_ids if resource_id == "browser.navigation.open"]},
-        {"provider_id": "browser.window.windows", "enabled": True, "priority": 10,
-         "capabilities": [resource_id for resource_id in resource_ids if resource_id == "browser.window.close"]},
-        {"provider_id": "media.spotify", "enabled": True, "priority": 10,
-         "capabilities": [resource_id for resource_id in resource_ids if resource_id.startswith("media.")]},
-    ]), encoding="utf-8")
+    (tmp_path / "browsers.json").write_text("[]", encoding="utf-8")
+    (tmp_path / "skills.json").write_text("[]", encoding="utf-8")
     return tmp_path
 
 
-class Process:
-    pid = 42
+class Executor:
+    def __init__(self, result=None):
+        self.calls = []
+        self.result = result or {"ok": True}
+
+    def execute(self, skill_id, args, execute, **kwargs):
+        self.calls.append((skill_id, args, execute, kwargs))
+        return {"skill_id": skill_id, **self.result}
 
 
-def frame(**parameters):
-    return {"act": "EXECUTE", "goal": "APPLICATION_CONTROL", "parameters": {"action": "OPEN", "application": "spotify", **parameters}}
-
-
-def test_harness_normalizes_lowercase_action_before_routing(tmp_path):
-    executor = type("Executor", (), {
-        "execute": lambda self, skill_id, args, execute, confirmed=False: {
-            "ok": True, "skill_id": skill_id, "arguments": args,
-        }
-    })()
+def test_harness_normalizes_action_and_routes_semantic_to_skill(tmp_path):
+    executor = Executor()
     harness = AgentHarness(registry(tmp_path), skill_executor=executor)
 
-    opened = harness._dispatch_turn("mở spotify", frame(action="open"))
-    played = harness._dispatch_turn("phát nhạc", {
+    opened = harness._dispatch_turn("mo spotify", {
+        "act": "EXECUTE", "goal": "APPLICATION_CONTROL",
+        "parameters": {"action": "open", "application": "spotify"},
+    })
+    played = harness._dispatch_turn("phat nhac", {
         "act": "EXECUTE", "goal": "MEDIA_CONTROL",
         "parameters": {"action": "play", "query": "One More Time"},
     })
 
-    assert opened["status"] == "EXECUTED"
+    assert opened["skill_id"] == "application.open"
     assert played["skill_id"] == "media.play"
+    assert executor.calls[0][1] == {"application": "spotify"}
 
 
-def test_local_dispatch_reports_started_process(monkeypatch, tmp_path):
-    calls = []
-    snapshots = iter([[], [{"handle": 7, "pid": 42, "title": "Spotify"}]])
-    monkeypatch.setattr("Runtime.engine.shutil.which", lambda executable: executable)
-    application_module = importlib.import_module("Runtime.Providers.Application")
-    monkeypatch.setattr(application_module, "observe_windows", lambda: next(snapshots))
-    harness = AgentHarness(registry(tmp_path), execute=True, runner=lambda argv: calls.append(argv) or Process())
+def test_route_parameter_cannot_change_application_semantic(tmp_path):
+    executor = Executor()
+    harness = AgentHarness(registry(tmp_path), skill_executor=executor)
 
-    result = harness._dispatch_turn("mở spotify", frame())
+    result = harness._dispatch_turn("mo spotify tren web", {
+        "act": "EXECUTE", "goal": "APPLICATION_CONTROL",
+        "parameters": {"action": "OPEN", "application": "spotify", "route": "WEB"},
+    })
 
-    assert result["status"] == "EXECUTED"
-    assert result["result"]["ok"] is True
-    assert result["result"]["evidence"] == {"handle": 7, "pid": 42, "title": "Spotify"}
-    assert calls == [["spotify.exe"]]
+    assert result["skill_id"] == "application.open"
+    assert executor.calls[0][0] == "application.open"
 
 
-def test_failed_local_dispatch_never_reports_executed(monkeypatch, tmp_path):
-    monkeypatch.setattr("Runtime.engine.shutil.which", lambda executable: executable)
+def test_web_open_routes_directly_without_harness_capability_check(tmp_path):
+    executor = Executor({"ok": False, "error": "PROVIDER_UNAVAILABLE"})
+    harness = AgentHarness(registry(tmp_path), skill_executor=executor)
 
-    def fail(_argv):
-        raise OSError("blocked")
-
-    result = AgentHarness(registry(tmp_path), execute=True, runner=fail)._dispatch_turn("mở spotify", frame())
+    result = harness._dispatch_turn("mo spotify tren web", {
+        "act": "EXECUTE", "goal": "WEB_OPEN", "parameters": {"target": "spotify"},
+    })
 
     assert result["status"] == "ERROR"
-    assert result["result"]["ok"] is False
-    assert result["result"]["error"] == "blocked"
+    assert result["skill_id"] == "web.open"
+    assert executor.calls[0][1] == {"target": "spotify", "browser": None}
 
 
-def test_web_dispatch_uses_registry_url(tmp_path):
-    opened = []
-    harness = AgentHarness(registry(tmp_path), execute=True, web_opener=lambda url: opened.append(url) or True)
+def test_model_supported_but_unimplemented_semantic_is_not_model_unsupported(tmp_path):
+    harness = AgentHarness(registry(tmp_path), skill_executor=Executor())
 
-    result = harness._dispatch_turn("mở spotify trên web", frame(route="WEB"))
-
-    assert result["status"] == "EXECUTED"
-    assert result["result"]["ok"] is True
-    assert result["result"]["evidence"] == {"opened": True}
-    assert opened == ["https://open.spotify.com"]
-
-
-def test_explicit_missing_browser_fails_without_fallback(monkeypatch, tmp_path):
-    opened = []
-    monkeypatch.setattr("Runtime.engine.shutil.which", lambda _executable: None)
-    harness = AgentHarness(registry(tmp_path), execute=True, web_opener=lambda url: opened.append(url) or True)
-
-    result = harness._dispatch_turn("mở spotify bằng chrome", frame(route="WEB", browser="chrome"))
+    result = harness._dispatch_turn("focus spotify", {
+        "act": "EXECUTE", "goal": "APPLICATION_CONTROL",
+        "parameters": {"action": "FOCUS", "application": "spotify"},
+    })
 
     assert result["status"] == "ERROR"
-    assert result["result"]["ok"] is False
-    assert result["result"]["error"] == "BROWSER_NOT_FOUND"
-    assert opened == []
+    assert result["error"] == "SKILL_NOT_AVAILABLE"
 
 
-def test_explicit_browser_starts_with_registry_url(monkeypatch, tmp_path):
+def test_system_control_is_not_semantically_reachable(tmp_path):
+    harness = AgentHarness(registry(tmp_path), skill_executor=Executor())
+
+    result = harness._dispatch_turn("tat may", {
+        "act": "EXECUTE", "goal": "SYSTEM_CONTROL", "parameters": {"action": "SHUTDOWN"},
+    })
+
+    assert result["error"] == "SKILL_NOT_AVAILABLE"
+
+
+def test_confirmation_grant_and_fallback_boundaries(tmp_path):
+    from Runtime.Policy.Confirmation import ConfirmationStore
+    from Runtime.Providers.Registry import ProviderRegistry
+    from Runtime.Resources.Dispatcher import ResourceDispatcher
+    from Runtime.Skills.Executor import SkillExecutor
+
+    skills = tmp_path / "skills.json"
+    resources = tmp_path / "resources.json"
+    skills.write_text(json.dumps([{
+        "skill_id": "danger", "enabled": True, "confirmation_required": True,
+        "resources": ["danger.run"],
+    }]), encoding="utf-8")
+    resources.write_text(json.dumps([{
+        "resource_id": "danger.run", "enabled": True, "risk": "HIGH",
+        "arguments": {"action": {"type": "string", "required": True}},
+    }]), encoding="utf-8")
     calls = []
-    monkeypatch.setattr("Runtime.engine.shutil.which", lambda executable: f"C:/bin/{executable}")
-    harness = AgentHarness(registry(tmp_path), execute=True, runner=lambda argv: calls.append(argv) or Process())
+    providers = ProviderRegistry()
+    providers.register("first", {"danger.run": lambda *_: calls.append("first") or {
+        "ok": False, "error": "PROVIDER_DISCONNECTED", "side_effect_state": "NOT_STARTED",
+    }}, priority=20)
+    providers.register("second", {"danger.run": lambda *_: calls.append("second") or {"ok": True}}, priority=10)
+    store = ConfirmationStore()
+    executor = SkillExecutor(skills, ResourceDispatcher(providers, resources, confirmation_store=store))
 
-    result = harness._dispatch_turn("mở spotify bằng chrome", frame(route="WEB", browser="chrome"))
-
-    assert result["status"] == "EXECUTED"
-    assert result["result"]["ok"] is True
-    assert result["result"]["evidence"] == {"pid": 42}
-    assert calls == [["C:/bin/chrome.exe", "https://open.spotify.com"]]
-
-
-def test_dry_run_has_no_side_effect(tmp_path):
-    harness = AgentHarness(registry(tmp_path), runner=lambda _argv: (_ for _ in ()).throw(AssertionError()), web_opener=lambda _url: (_ for _ in ()).throw(AssertionError()))
-
-    result = harness._dispatch_turn("mở spotify trên web", frame(route="WEB"))
-
-    assert result["status"] == "ROUTED"
-    assert result["result"]["ok"] is False
-    assert result["result"]["error"] == "EXECUTION_DISABLED"
+    assert executor.execute("danger", {"action": "RUN"}, True)["error"] == "CONFIRMATION_REQUIRED"
+    grant = store.issue("req", "danger", "danger.run", {"action": "RUN"}, "HIGH")
+    result = executor.execute("danger", {"action": "RUN"}, True, confirmation_grant=grant)
+    assert result["ok"] is True and calls == ["first", "second"]
+    assert result["request_id"] == "req"
+    assert executor.execute("danger", {"action": "RUN"}, True, confirmation_grant=grant)["error"] == "POLICY_DENIED"
 
 
-def test_web_open_goal_uses_application_registry(tmp_path):
-    harness = AgentHarness(registry(tmp_path))
-    model_frame = {"act": "EXECUTE", "goal": "WEB_OPEN", "parameters": {"target": "spotify"}}
+def test_negative_phrase_containing_ok_never_confirms(tmp_path):
+    from datetime import datetime, timedelta
+    from Runtime.engine import PendingFrame
 
-    result = harness._dispatch_turn("mở spotify trên web", model_frame)
+    executor = Executor()
+    harness = AgentHarness(registry(tmp_path), skill_executor=executor)
+    harness.pending_frame = PendingFrame(
+        request_id="req", skill_id="application.close",
+        resource_id="application.control.close", arguments={"application": "notepad"},
+        risk="MEDIUM", created_at=datetime.now(), expires_at=datetime.now() + timedelta(seconds=60),
+        description="đóng notepad",
+    )
 
-    assert result["status"] == "ROUTED"
-    assert result["route"] == "WEB"
-    assert result["app_id"] == "spotify"
-    assert result["result"]["dry_run"] is True
+    result = harness._dispatch_turn("không ok", {
+        "act": "RESPOND", "goal": "SOCIAL_RESPONSE", "parameters": {"intent": "ACKNOWLEDGEMENT"},
+    })
+
+    assert result["status"] != "EXECUTED"
+    assert harness.pending_frame is not None
+    assert all(call[0] != "application.close" for call in executor.calls)
 
 
-def test_invalid_model_span_falls_back_to_raw_input(tmp_path):
-    harness = AgentHarness(registry(tmp_path))
-    model_frame = {
-        "act": "EXECUTE",
-        "goal": "WEB_OPEN",
-        "parameters": {"target": {"source": "input_span", "value": "."}},
-    }
+def test_semantic_parity_is_bidirectional_and_local_app_needs_no_web_url():
+    from pathlib import Path
+    from Runtime.Contracts.Semantics import ROUTES, validate_semantic_parity
+    from Runtime.Contracts.Validate import load_manifest
 
-    result = harness._dispatch_turn("mở spotify trên web", model_frame)
+    root = Path(__file__).parents[1] / "Runtime"
+    ontology = json.loads((root / "Model/VSAD/0.0.4/config.json").read_text(encoding="utf-8"))
+    skills = load_manifest(root / "Registry/skills.json")
+    resources = {item["resource_id"]: item for item in load_manifest(root / "Registry/resources.json")}
 
-    assert result["status"] == "ROUTED"
-    assert result["app_id"] == "spotify"
+    assert validate_semantic_parity(ontology, skills, ROUTES) == []
+    missing = dict(ROUTES)
+    missing.pop(("APPLICATION_CONTROL", "FOCUS"))
+    assert "MODEL_SEMANTIC_UNDECLARED:APPLICATION_CONTROL:FOCUS" in validate_semantic_parity(
+        ontology, skills, missing,
+    )
+    assert resources["application.catalog.resolve"]["result"]["web_url"].get("required_on_success") is not True

@@ -53,10 +53,10 @@ Runtime/Providers/*.py          # OS/API/package implementations
 ```
 
 - `Skill.md` mô tả behavior cho người đọc; runtime không parse file này để cấp quyền.
-- Registry là machine-readable authority cho skill, entity, resource, provider, risk và `enabled`.
-- `SkillExecutor` validate typed inputs; skill có `steps` thì dispatch tuần tự và dừng ở lỗi đầu tiên, skill atomic/action matrix chỉ dispatch resource được chọn.
-- `ResourceDispatcher` fail closed theo `resources.json`, resolve provider khả dụng và trả cả `resource_id` lẫn `provider_id` trong result.
-- Provider công bố availability theo capability; dependency Win32/UIA/API/package nằm sau provider boundary.
+- Ontology VSAD pin `contract_version=2.0` và `release_version=0.0.4` là semantic authority; Registry là machine-readable authority cho workflow, resource, provider và risk.
+- `SkillExecutor` resolve named linear steps và explicit `resource_by_action`; không suy resource từ suffix.
+- `ResourceDispatcher` enforce typed contract, effective risk và single-use `ConfirmationGrant` trước provider boundary.
+- Provider health được kiểm tại dispatch time; fallback chỉ cho lỗi allowlisted khi `side_effect_state=NOT_STARTED`.
 - Target như YouTube, Spotify và Facebook là entity/data; target không quyết định Python implementation.
 
 Luồng runtime:
@@ -101,7 +101,7 @@ action=OPEN
 → application.open
 ```
 
-Runtime dùng raw input, semantic frame, state, registry và availability. Model không cần biết `application.open` là ID gì hoặc workflow có bao nhiêu bước.
+Runtime route `GOAL + action` sang skill từ semantic frame. Provider availability không được đổi semantic hoặc fallback ứng dụng local sang web.
 
 ## 4. Resource catalog
 
@@ -117,11 +117,11 @@ Resource catalog là foundation để build skill. Mỗi hàng là một public 
 | `window.control.<list|focus>` | Resolve và focus cửa sổ |
 | `media.catalog.<search|resolve>` | Resolve media item |
 | `media.playback.<play|pause|resume|stop|next|previous>` | Điều khiển media session |
-| `audio.volume.<get|set|increase|decrease>` | Điều khiển âm lượng |
+| `audio.volume.<get|set|increase|decrease>` | Nội bộ; chưa semantic-reachable cho đến khi media-volume contract được chốt |
 | `browser.state.<active|tabs>` | Đọc browser và tab state |
 | `browser.navigation.<open|search|back|forward|refresh|scroll|home>` | Điều hướng web |
 | `browser.tabs.<new|close|switch|reopen>` | Quản lý tab |
-| `system.command.<lock|shutdown|restart|sleep|screenshot>` | Built-in OS commands allowlisted |
+| `system.command.<lock|shutdown|restart|sleep|screenshot>` | Legacy internal resources; `RUN_COMMAND` chưa có runtime skill |
 | `task.store.<last|active>` | Truy vấn task state |
 | `response.renderer.<pre|clarify|confirm|success|failure>` | Sinh response grounded |
 | `speech.asr.transcribe` | Chuyển audio thành text |
@@ -290,7 +290,7 @@ Skill risk không được thấp hơn resource risk cao nhất mà workflow g�
 ```text
 1. Reject ACT không cho phép side effect.
 2. Filter skill theo GOAL và generic action.
-3. Filter theo enabled resources và runtime availability.
+3. Chọn route semantic đã khai báo; unavailable semantic trả `SKILL_NOT_AVAILABLE`.
 4. Match exact aliases/entity catalogs.
 5. Match normalized tokens.
 6. Match fuzzy text nếu cần.
@@ -320,23 +320,23 @@ Local embedding là optional optimization; skill system không phụ thuộc m�
 |---|---|---|---|---|
 | `media.play` | `MEDIA_CONTROL/PLAY` | optional `query`, `platform` | media catalog, playback | resolve source/item → play |
 | `media.transport` | PAUSE/RESUME/STOP/NEXT/PREVIOUS | `action` | media playback | resolve active session → apply action |
-| `media.volume` | `MEDIA_CONTROL` volume actions hoặc `RUN_COMMAND/SET_VOLUME` | `action`, optional `volume` | audio volume | normalize command → validate level → apply |
+| `media.volume` | Chưa semantic-reachable | `action`, optional `volume` | audio volume | Chờ chốt ontology/runtime contract |
 
 ### 9.3. Web and browser skills
 
 | Skill ID | Semantic compatibility | Inputs | Resources | Workflow |
 |---|---|---|---|---|
 | `web.open` | `WEB_OPEN` | `target`, optional `browser` | browser state/navigation | resolve browser/target → open |
-| `web.search` | `WEB_SEARCH` | `query`, optional `engine` | browser navigation | resolve engine → construct safe search → open |
-| `web.navigate` | `WEB_NAVIGATE` | `action`, optional `amount` | browser state/navigation | validate active browser → navigate |
-| `tab.manage` | `TAB_CONTROL` | `action`, optional tab selector | browser state/tabs | resolve tab if needed → apply action |
+| `web.search` | `WEB_SEARCH` | — | — | Chưa có runtime workflow; fail closed |
+| `web.navigate` | `WEB_NAVIGATE` | — | — | Chưa có runtime workflow; fail closed |
+| `tab.manage` | `TAB_CONTROL` | — | — | Chưa có runtime workflow; fail closed |
 
 ### 9.4. System and task skills
 
 | Skill ID | Semantic compatibility | Inputs | Resources | Workflow |
 |---|---|---|---|---|
-| `system.command` | `RUN_COMMAND` | `command_id`, typed `arguments` | system command, confirmation store | allowlist → confirmation policy → execute |
-| `task.status` | `TASK_STATUS` | optional `scope` | task store | query state → render status |
+| `system.command` | `RUN_COMMAND` | — | — | Chưa có runtime skill; fail closed |
+| `task.status` | `TASK_STATUS` | — | — | Chưa có runtime workflow; fail closed |
 
 Built-in system command policy:
 

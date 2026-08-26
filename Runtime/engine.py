@@ -10,7 +10,6 @@ from __future__ import annotations
 import difflib
 import json
 import re
-import shutil
 import subprocess
 import unicodedata
 from dataclasses import dataclass, field
@@ -19,6 +18,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Sequence
 
 from Runtime.Providers.Builtin import build_builtin_providers
+from Runtime.Contracts.Validate import load_manifest, validate_registry
+from Runtime.Policy.Confirmation import ConfirmationStore
 from Runtime.Resources.Dispatcher import ResourceDispatcher
 from Runtime.Skills.Executor import SkillExecutor
 
@@ -31,7 +32,9 @@ def normalize_text(text: str) -> str:
 
 @dataclass
 class PendingFrame:
+    request_id: str
     skill_id: str
+    resource_id: str
     arguments: Dict[str, Any]
     risk: str
     created_at: datetime
@@ -142,15 +145,21 @@ class AgentHarness:
         self.skills_path = registry_dir / "skills.json"
         self.skills: List[Dict[str, Any]] = []
         if self.skills_path.exists():
-            self.skills = json.loads(self.skills_path.read_text(encoding="utf-8"))
+            self.skills = load_manifest(self.skills_path)
         self.pending_frame: Optional[PendingFrame] = None
         self.memory = DialogueMemory()
         self.execute = execute
         self.runner = runner or subprocess.Popen
+        self.confirmations = ConfirmationStore()
+        manifest_data = json.loads(self.skills_path.read_text(encoding="utf-8")) if self.skills_path.is_file() else None
+        if skill_executor is None and isinstance(manifest_data, dict):
+            ontology = registry_dir.parent / "Model" / "VSAD" / "0.0.4" / "config.json"
+            validate_registry(registry_dir, ontology)
         providers = build_builtin_providers(registry_dir, self.runner, web_opener) if skill_executor is None else None
         self.skill_executor = skill_executor or SkillExecutor(
             self.skills_path,
-            ResourceDispatcher(providers, registry_dir / "resources.json"),
+            ResourceDispatcher(providers, registry_dir / "resources.json", confirmation_store=self.confirmations),
+            confirmation_store=self.confirmations,
         )
 
     def step(self, raw_input: str, vsad_model: Any) -> Dict[str, Any]:
@@ -175,12 +184,14 @@ class AgentHarness:
         now = datetime.now()
         norm_in = normalize_text(raw_input)
 
-        # Context-aware Confirmation override
+        # Confirmation is a security boundary: exact phrases only, cancellation wins.
         if self.pending_frame:
-            if any(k in norm_in for k in ("đồng ý", "dong y", "xác nhận", "xac nhan", "chắc chắn", "ok", "yes", "tiếp tục")):
-                act = "CONFIRM"
-            elif any(k in norm_in for k in ("hủy", "huy", "thôi", "khong", "không", "cancel", "no", "dừng")):
+            cancel = {"huy", "thoi", "khong", "cancel", "no", "dung"}
+            confirm = {"dong y", "xac nhan", "chac chan", "ok", "yes", "tiep tuc"}
+            if norm_in in cancel:
                 act = "CANCEL"
+            elif norm_in in confirm:
+                act = "CONFIRM"
 
         if act == "CONFIRM":
             if not self.pending_frame:
@@ -190,7 +201,11 @@ class AgentHarness:
                 return {"status": "EXPIRED", "reason": "CONFIRMATION_EXPIRED", "response": "Yêu cầu trước đó đã hết hạn xác nhận."}
             target_frame = self.pending_frame
             self.pending_frame = None
-            exec_result = self._execute_skill(target_frame.skill_id, target_frame.arguments, confirmed=True)
+            grant = self.confirmations.issue(
+                target_frame.request_id, target_frame.skill_id, target_frame.resource_id,
+                target_frame.arguments, target_frame.risk,
+            )
+            exec_result = self._execute_skill(target_frame.skill_id, target_frame.arguments, confirmation_grant=grant)
             return {
                 "status": "EXECUTED" if exec_result["ok"] else "ERROR",
                 "skill_id": target_frame.skill_id, "result": exec_result,
@@ -220,14 +235,6 @@ class AgentHarness:
             return {"status": "UNSUPPORTED", "response": "Xin lỗi, tôi chưa hỗ trợ yêu cầu này."}
 
         if act == "ASK_CLARIFICATION":
-            cmd_id = params.get("command_id")
-            if goal == "RUN_COMMAND" and cmd_id in ("SHUTDOWN_SYSTEM", "RESTART_SYSTEM"):
-                desc = "tắt máy tính" if cmd_id == "SHUTDOWN_SYSTEM" else "khởi động lại máy tính"
-                self.pending_frame = PendingFrame(
-                    skill_id="system.command", arguments={"command_id": cmd_id}, risk="HIGH",
-                    created_at=datetime.now(), expires_at=datetime.now() + timedelta(seconds=60), description=desc
-                )
-                return {"status": "AWAITING_CONFIRMATION", "risk": "HIGH", "response": f"Bạn có chắc chắn muốn {desc} không?"}
             return {"status": "CLARIFICATION_NEEDED", "response": model_frame.get("response") or "Bạn có thể nói rõ hơn yêu cầu được không?"}
 
         if act == "EXECUTE":
@@ -236,128 +243,60 @@ class AgentHarness:
         return {"status": "INVALID_FRAME", "response": "Không thể xử lý định dạng yêu cầu."}
 
     def _handle_execute(self, raw_input: str, goal: Optional[str], params: Dict[str, Any]) -> Dict[str, Any]:
+        from Runtime.Contracts.Semantics import ROUTES
+
         params = dict(params)
         if isinstance(params.get("action"), str):
             params["action"] = params["action"].upper()
-        if goal in ("APPLICATION_CONTROL", "WEB_OPEN"):
-            action = params.get("action", "OPEN")
-            raw_app = params.get("target" if goal == "WEB_OPEN" else "application", "")
-            if isinstance(raw_app, dict):
-                raw_app = raw_app.get("value", "")
-            resolved_app, score = self.app_registry.resolve(raw_app)
-            if not resolved_app:
-                resolved_app, score = self.app_registry.resolve(raw_input)
-
-            if not resolved_app:
-                return {"status": "UNSUPPORTED", "reason": "APP_NOT_FOUND", "response": f"Không tìm thấy ứng dụng '{raw_app or raw_input}' trong hệ thống."}
-
-            if action not in {"OPEN", "CLOSE"}:
-                return {"status": "UNSUPPORTED", "reason": "ACTION_NOT_SUPPORTED", "response": f"Chưa hỗ trợ tác vụ {action} với ứng dụng."}
-
-            if action == "CLOSE":
-                if resolved_app.get("type") == "web":
-                    result = self._execute_skill("web.close", {"title": resolved_app.get("window_title", resolved_app["name"])})
-                    return {"status": "EXECUTED" if result["ok"] else "ERROR", "skill_id": "web.close", "result": result,
-                            "response": "Đã đóng trang web." if result["ok"] else f"Không thể đóng trang web: {result.get('error')}."}
-                self.pending_frame = PendingFrame(
-                    skill_id="application.close", arguments={"application": resolved_app["app_id"]}, risk="MEDIUM",
-                    created_at=datetime.now(), expires_at=datetime.now() + timedelta(seconds=60),
-                    description=f"đóng {resolved_app['name']}",
-                )
-                return {"status": "AWAITING_CONFIRMATION", "skill_id": "application.close", "risk": "MEDIUM",
-                        "response": f"Bạn có chắc chắn muốn đóng {resolved_app['name']} không?"}
-
-            local_executable = self.app_registry._local_executable(resolved_app)
-            web_url = self.app_registry._web_url(resolved_app)
-            explicit_web = goal == "WEB_OPEN" or params.get("route") == "WEB" or params.get("browser")
-            local_available = bool(local_executable and shutil.which(local_executable))
-            if explicit_web:
-                route, reason = ("WEB", "WEB_REQUESTED") if web_url else ("UNSUPPORTED", "NO_CAPABILITY")
-            elif local_available:
-                route, reason = "LOCAL", "LOCAL_AVAILABLE"
-            elif web_url:
-                route, reason = "WEB", "LOCAL_UNAVAILABLE_WEB_AVAILABLE"
-            else:
-                route, reason = "UNSUPPORTED", "NO_CAPABILITY"
-
-            if route == "UNSUPPORTED":
-                return {"status": "UNSUPPORTED", "reason": reason, "resolved": resolved_app,
-                        "response": f"Không có capability phù hợp cho {resolved_app['name']}."}
-            self.memory.update_state("current_target_application", resolved_app["app_id"])
-            if route == "LOCAL":
-                result = self._execute_skill("application.open", {"application": resolved_app["app_id"]})
-                status = "EXECUTED" if result["ok"] else ("ROUTED" if result.get("error") == "EXECUTION_DISABLED" else "ERROR")
-                return {"status": status, "route": route, "reason": reason,
-                        "app_id": resolved_app["app_id"], "app_name": resolved_app["name"],
-                        "score": score, "local_executable": local_executable, "web_url": web_url,
-                        "browser": params.get("browser"), "result": result,
-                        "response": "Đã mở ứng dụng." if result["ok"] else f"Không thể mở ứng dụng: {result.get('error')}."}
-            result = self._execute_skill("web.open", {"url": web_url, "browser": params.get("browser")})
-            status = "EXECUTED" if result["ok"] else ("ROUTED" if result.get("error") == "EXECUTION_DISABLED" else "ERROR")
-            return {"status": status, "route": route, "reason": reason,
-                    "app_id": resolved_app["app_id"], "app_name": resolved_app["name"],
-                    "score": score, "local_executable": local_executable, "web_url": web_url,
-                    "browser": params.get("browser"), "result": result,
-                    "response": "Đã mở trang web." if result["ok"] else f"Không thể mở trang web: {result.get('error')}."}
-
-        if goal == "MEDIA_CONTROL":
-            action = params.get("action", "PLAY")
-            raw_query = params.get("query", "")
-            if isinstance(raw_query, dict):
-                raw_query = raw_query.get("value", "")
-            skill_id = "media.play" if action == "PLAY" else ("media.volume" if "VOLUME" in action else "media.transport")
-            exec_result = self._execute_skill(skill_id, {"action": action, "query": raw_query, "platform": params.get("platform", "DEFAULT")})
-            if raw_query:
-                self.memory.update_state("active_media", raw_query)
-            status = "EXECUTED" if exec_result["ok"] else ("ROUTED" if exec_result.get("error") == "EXECUTION_DISABLED" else "ERROR")
-            return {"status": status, "skill_id": skill_id, "result": exec_result,
-                    "response": f"Đã thực hiện media: {raw_query or action}." if exec_result["ok"] else f"Không thể thực hiện media: {exec_result.get('error')}."}
-
-        if goal == "SYSTEM_CONTROL":
-            action = params.get("action", "").upper()
-            if action in ("SHUTDOWN", "RESTART"):
-                description = "tắt nguồn" if action == "SHUTDOWN" else "khởi động lại"
-                self.pending_frame = PendingFrame(
-                    skill_id="system.power", arguments={"action": action}, risk="HIGH",
-                    created_at=datetime.now(), expires_at=datetime.now() + timedelta(seconds=60),
-                    description=description,
-                )
-                return {"status": "AWAITING_CONFIRMATION", "skill_id": "system.power", "risk": "HIGH",
-                        "response": f"Bạn có chắc chắn muốn {description} không?"}
-            mapping = {
-                "SLEEP": ("system.power", {"action": "SLEEP"}),
-                "SET_BRIGHTNESS": ("system.brightness", {"value": params.get("value")}),
-                "SET_VOLUME": ("system.volume", {"value": params.get("value")}),
-                "NIGHT_LIGHT_ON": ("system.night_light", {"enabled": True}),
-                "NIGHT_LIGHT_OFF": ("system.night_light", {"enabled": False}),
+        action = params.get("action")
+        skill_id = ROUTES.get((goal, action), ROUTES.get((goal, None)))
+        if skill_id is None:
+            return {
+                "status": "ERROR", "error": "SKILL_NOT_AVAILABLE",
+                "response": f"Runtime chưa có skill khả dụng cho {goal}/{action or '-'}."
             }
-            if action not in mapping:
-                return {"status": "UNSUPPORTED", "reason": "ACTION_NOT_SUPPORTED", "response": f"Chưa hỗ trợ system action {action}."}
-            skill_id, arguments = mapping[action]
-            exec_result = self._execute_skill(skill_id, arguments)
-            status = ("EXECUTED" if exec_result["ok"] else "ROUTED" if exec_result.get("error") == "EXECUTION_DISABLED"
-                      else "UNSUPPORTED" if exec_result.get("error") in ("SKILL_DISABLED", "CAPABILITY_DISABLED") else "ERROR")
-            return {"status": status, "skill_id": skill_id, "result": exec_result,
-                    "response": "Đã thực hiện điều khiển hệ thống." if exec_result["ok"] else f"Không thể điều khiển hệ thống: {exec_result.get('error')}."}
 
-        if goal == "RUN_COMMAND":
-            cmd_id = params.get("command_id")
-            if cmd_id == "SLEEP_SYSTEM":
-                exec_result = self._execute_skill("system.command", {"command_id": "SLEEP_SYSTEM"})
-                return {"status": "EXECUTED" if exec_result["ok"] else "ERROR", "skill_id": "system.command", "result": exec_result,
-                        "response": "Đang đưa máy tính vào chế độ ngủ." if exec_result["ok"] else f"Không thể đưa máy vào chế độ ngủ: {exec_result.get('error')}."}
-            if cmd_id in ("SHUTDOWN_SYSTEM", "RESTART_SYSTEM"):
-                desc = "tắt máy tính" if cmd_id == "SHUTDOWN_SYSTEM" else "khởi động lại máy tính"
-                self.pending_frame = PendingFrame(
-                    skill_id="system.command", arguments={"command_id": cmd_id}, risk="HIGH",
-                    created_at=datetime.now(), expires_at=datetime.now() + timedelta(seconds=60), description=desc
-                )
-                return {"status": "AWAITING_CONFIRMATION", "risk": "HIGH", "response": f"Bạn có chắc chắn muốn {desc} không?"}
+        arguments: Dict[str, Any]
+        if skill_id.startswith("application."):
+            application = params.get("application", "")
+            if isinstance(application, dict):
+                application = application.get("value", "")
+            arguments = {"application": application or raw_input}
+        elif skill_id == "web.open":
+            target = params.get("target", "")
+            if isinstance(target, dict):
+                target = target.get("value", "")
+            arguments = {"target": target or raw_input, "browser": params.get("browser")}
+        elif skill_id == "media.play":
+            query = params.get("query", "")
+            if isinstance(query, dict):
+                query = query.get("value", "")
+            arguments = {"query": query, "platform": params.get("platform", "DEFAULT")}
+        elif skill_id == "media.transport":
+            arguments = {"action": action, "platform": params.get("platform", "DEFAULT")}
+        else:
+            arguments = params
 
-        return {"status": "UNSUPPORTED", "response": f"Chưa hỗ trợ tác vụ {goal}."}
+        result = self._execute_skill(skill_id, arguments)
+        if result.get("error") == "CONFIRMATION_REQUIRED":
+            risk = result["effective_risk"]
+            description = f"thực hiện {skill_id}"
+            self.pending_frame = PendingFrame(
+                request_id=result["request_id"], skill_id=skill_id,
+                resource_id=result["resource_id"], arguments=arguments, risk=risk,
+                created_at=datetime.now(), expires_at=datetime.now() + timedelta(seconds=60),
+                description=description,
+            )
+            return {"status": "AWAITING_CONFIRMATION", "skill_id": skill_id, "risk": risk,
+                    "response": f"Bạn có chắc chắn muốn {description} không?"}
+        status = "EXECUTED" if result.get("ok") else ("ROUTED" if result.get("error") == "EXECUTION_DISABLED" else "ERROR")
+        return {"status": status, "skill_id": skill_id, "result": result,
+                "response": "Đã thực hiện yêu cầu." if result.get("ok") else f"Không thể thực hiện: {result.get('error')}."}
 
-    def _execute_skill(self, skill_id: str, args: Dict[str, Any], confirmed: bool = False) -> Dict[str, Any]:
-        return self.skill_executor.execute(skill_id, args, self.execute, confirmed=confirmed)
+    def _execute_skill(self, skill_id: str, args: Dict[str, Any], confirmation_grant: Any = None) -> Dict[str, Any]:
+        if confirmation_grant is None:
+            return self.skill_executor.execute(skill_id, args, self.execute)
+        return self.skill_executor.execute(skill_id, args, self.execute, confirmation_grant=confirmation_grant)
 
 
 # Alias for backward compatibility

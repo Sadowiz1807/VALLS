@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import importlib.util
-import json
 import os
 import shutil
 import subprocess
@@ -13,12 +12,13 @@ from Runtime.Providers.Browser import BrowserProvider
 from Runtime.Providers.Media import MediaProvider
 from Runtime.Providers.Registry import ProviderRegistry
 from Runtime.Providers.System import SystemProvider
+from Runtime.Contracts.Validate import BUILTIN_PROVIDER_IDS, RegistryValidationError, load_manifest
 from Runtime.Resources.Registry import resolve
 
 
 def _dependency_available(name: str) -> bool:
     modules = {
-        "application.windows": ("win32gui", "win32process", "psutil"),
+        "application.windows": ("win32gui", "win32process"),
         "browser.window": ("win32gui", "pywinauto"),
         "system.volume": ("pycaw",),
         "system.night_light": ("pywinauto",),
@@ -58,8 +58,8 @@ def build_builtin_providers(
             "application.catalog.resolve": lambda args, _execute: _resolve_application(registry_dir, args),
         }, True),
         "application.control.windows": ({
-            "application.control.open": lambda args, execute: application.open(args.get("resolved") or args.get("application", ""), execute),
-            "application.control.close": lambda args, execute: application.close(args.get("resolved") or args.get("application", ""), execute),
+            "application.control.open": lambda args, execute: application.open(args.get("entity", ""), execute),
+            "application.control.close": lambda args, execute: application.close(args.get("entity", ""), execute),
         }, dependency_available("application.windows")),
         "browser.navigation.windows": ({
             "browser.navigation.open": lambda args, execute: browser.open(args.get("url", ""), args.get("browser"), execute),
@@ -90,12 +90,12 @@ def build_builtin_providers(
     }
 
     manifest = registry_dir / "providers.json"
-    declarations = json.loads(manifest.read_text(encoding="utf-8")) if manifest.is_file() else []
+    declarations = load_manifest(manifest) if manifest.is_file() else []
     providers = ProviderRegistry()
     for declaration in declarations:
         provider_id = declaration.get("provider_id")
-        if provider_id not in implementations:
-            continue
+        if provider_id not in BUILTIN_PROVIDER_IDS or provider_id not in implementations:
+            raise RegistryValidationError(f"PROVIDER_IMPLEMENTATION_UNKNOWN:{provider_id}")
         implementation, healthy = implementations[provider_id]
         capabilities = {
             resource_id: implementation[resource_id]
@@ -103,12 +103,19 @@ def build_builtin_providers(
         }
         providers.register(
             provider_id, capabilities,
-            available=bool(declaration.get("enabled", False) and healthy),
+            available=bool(declaration.get("enabled", False) and (healthy if provider_id != "media.spotify" else True)),
             priority=int(declaration.get("priority", 0)),
+            health=(lambda _resource: media_available()) if provider_id == "media.spotify" else None,
         )
     return providers
 
 
 def _resolve_application(registry_dir: Path, arguments: dict) -> dict:
-    item = resolve(registry_dir / "applications.json", arguments.get("application", ""))
-    return {"ok": bool(item), "evidence": item, "error": None if item else "APPLICATION_UNSUPPORTED"}
+    item = resolve(registry_dir / "applications.json", arguments.get("query", ""))
+    if not item:
+        return {"ok": False, "error": "APPLICATION_UNSUPPORTED"}
+    result = {"ok": True, "application_id": item["app_id"], "entity": item, "error": None}
+    web_url = (item.get("web") or {}).get("url")
+    if web_url:
+        result["web_url"] = web_url
+    return result
