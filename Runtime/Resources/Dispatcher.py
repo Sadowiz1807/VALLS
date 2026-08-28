@@ -29,7 +29,14 @@ class ResourceDispatcher:
     @staticmethod
     def _valid(value: Any, contract: dict) -> bool:
         expected = {"string": str, "integer": int, "boolean": bool, "object": dict}.get(contract.get("type"))
-        return expected is None or isinstance(value, expected) and not (expected is int and isinstance(value, bool))
+        if expected is not None and (not isinstance(value, expected) or expected is int and isinstance(value, bool)):
+            return False
+        if "enum" in contract and value not in contract["enum"]:
+            return False
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            if value < contract.get("minimum", value) or value > contract.get("maximum", value):
+                return False
+        return True
 
     def _validate(self, values: dict[str, Any], contracts: dict[str, dict], success: bool = False) -> bool:
         for name, contract in contracts.items():
@@ -52,6 +59,9 @@ class ResourceDispatcher:
         if self.manifest_required and (not resource or not resource.get("enabled", True)):
             return {"ok": False, "resource_id": resource_id, "error": "RESOURCE_DISABLED"}
         if resource and not self._validate(arguments, resource.get("arguments", {})):
+            return {"ok": False, "resource_id": resource_id, "error": "RESOURCE_CONTRACT_VIOLATION"}
+        exactly_one = resource.get("exactly_one_of", []) if resource else []
+        if exactly_one and sum(arguments.get(name) is not None for name in exactly_one) != 1:
             return {"ok": False, "resource_id": resource_id, "error": "RESOURCE_CONTRACT_VIOLATION"}
         risk = self._risk(resource, confirmation_arguments or arguments)
         needs_grant = execute and (risk == "HIGH" or confirmation_required)
@@ -85,7 +95,7 @@ class ResourceDispatcher:
         for provider in providers:
             try:
                 result = provider.capabilities[resource_id](arguments, execute)
-            except (OSError, RuntimeError) as exc:
+            except Exception as exc:
                 result = {"ok": False, "error": "EXECUTION_FAILED", "message": str(exc),
                           "side_effect_state": "UNKNOWN"}
             if not isinstance(result, dict):

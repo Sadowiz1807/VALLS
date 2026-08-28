@@ -1,8 +1,85 @@
 import importlib
 import json
+import shutil
 from pathlib import Path
 
+import pytest
+
+from Runtime.Contracts.Errors import error_spec
+from Runtime.Contracts.Validate import RegistryValidationError, validate_registry
+from Runtime.Providers.Web import build_search_url
 from Runtime.engine import AgentHarness
+
+
+def test_new_input_and_target_errors_are_nonfallbackable_before_side_effect():
+    for code, category in (("INPUT_VALUE_INVALID", "INPUT"), ("TARGET_AMBIGUOUS", "TARGET")):
+        spec = error_spec(code)
+        assert spec.category == category
+        assert spec.fallbackable is False
+        assert spec.default_side_effect_state == "NOT_STARTED"
+
+
+def test_legacy_runtime_authorities_stay_absent():
+    root = Path(__file__).parents[1] / "Runtime"
+    source = "\n".join(path.read_text(encoding="utf-8") for path in root.rglob("*.py"))
+
+    assert 'params.get("route")' not in source
+    assert "confirmed=True" not in source
+    assert "system.command" not in source
+
+
+def test_web_search_builds_encoded_allowlisted_url_and_routes_workflow():
+    assert build_search_url({"query": "học python", "engine": "DUCKDUCKGO"}) == {
+        "ok": True, "url": "https://duckduckgo.com/?q=h%E1%BB%8Dc+python", "engine": "DUCKDUCKGO",
+    }
+    assert build_search_url({"query": "python", "engine": "YAHOO"})["error"] == "INPUT_VALUE_INVALID"
+    root = Path(__file__).parents[1] / "Runtime"
+    assert validate_registry(root / "Registry", root / "Model/VSAD/0.0.4/config.json") == {
+        "skills": 12, "resources": 26, "providers": 11, "ontology_release": "0.0.4",
+    }
+
+
+def test_spotify_stop_is_blocked_before_provider_attempts():
+    root = Path(__file__).parents[1] / "Runtime" / "Registry"
+    result = AgentHarness(root, execute=True)._dispatch_turn("dừng Spotify", {
+        "act": "EXECUTE", "goal": "MEDIA_CONTROL",
+        "parameters": {"action": "STOP", "platform": "SPOTIFY"},
+    })
+
+    assert result["status"] == "ERROR"
+    assert result["result"] == {
+        "ok": False, "skill_id": "media.transport", "error": "SKILL_NOT_AVAILABLE",
+    }
+
+
+def test_title_only_browser_close_skill_and_resource_are_disabled():
+    root = Path(__file__).parents[1] / "Runtime" / "Registry"
+    skills = json.loads((root / "skills.json").read_text(encoding="utf-8"))["items"]
+    resources = json.loads((root / "resources.json").read_text(encoding="utf-8"))["items"]
+
+    assert next(x for x in skills if x["skill_id"] == "web.close")["enabled"] is False
+    assert next(x for x in resources if x["resource_id"] == "browser.window.close")["enabled"] is False
+
+
+def test_media_play_contract_requires_observed_readback_on_success():
+    root = Path(__file__).parents[1] / "Runtime" / "Registry"
+    resources = json.loads((root / "resources.json").read_text(encoding="utf-8"))["items"]
+    play = next(x for x in resources if x["resource_id"] == "media.playback.play")
+
+    assert play["result"]["observed"] == {"type": "object", "required_on_success": True}
+
+
+def test_validator_rejects_enabled_skill_using_disabled_resource(tmp_path):
+    root = Path(__file__).parents[1] / "Runtime"
+    registry = tmp_path / "Registry"
+    shutil.copytree(root / "Registry", registry)
+    skills_path = registry / "skills.json"
+    skills = json.loads(skills_path.read_text(encoding="utf-8"))
+    next(x for x in skills["items"] if x["skill_id"] == "web.close")["enabled"] = True
+    skills_path.write_text(json.dumps(skills), encoding="utf-8")
+
+    with pytest.raises(RegistryValidationError, match="ENABLED_SKILL_USES_DISABLED_RESOURCE:web.close"):
+        validate_registry(registry, root / "Model/VSAD/0.0.4/config.json")
 
 
 def test_browser_close_window_matches_title_without_killing_process(monkeypatch):

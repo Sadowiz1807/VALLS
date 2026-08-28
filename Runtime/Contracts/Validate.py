@@ -7,8 +7,9 @@ from typing import Any
 from Runtime.Contracts.Semantics import ROUTES, validate_semantic_parity
 
 BUILTIN_PROVIDER_IDS = frozenset({
+    "builtin.web-search",
     "application.catalog.builtin", "application.control.windows",
-    "browser.navigation.windows", "browser.window.windows", "media.spotify",
+    "browser.navigation.windows", "media.spotify", "media.spotify-native",
     "system.power.windows", "system.brightness.windows", "system.volume.windows",
     "system.night-light.windows", "response.builtin",
 })
@@ -74,6 +75,9 @@ def validate_registry(registry_dir: Path, ontology_path: Path) -> dict[str, Any]
     levels = {"NONE": 0, "LOW": 1, "MEDIUM": 2, "HIGH": 3}
     for skill in skills:
         declared = set(skill.get("resources", []))
+        if (skill.get("enabled", True) and declared
+                and all(not resource_map[item].get("enabled", True) for item in declared)):
+            raise RegistryValidationError(f"ENABLED_SKILL_USES_DISABLED_RESOURCE:{skill['skill_id']}")
         mapping = skill.get("resource_by_action", {})
         if not set(mapping.values()) <= declared:
             raise RegistryValidationError(f"ACTION_RESOURCE_NOT_DECLARED:{skill['skill_id']}")

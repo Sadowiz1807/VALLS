@@ -8,6 +8,7 @@ from Runtime.Providers import Builtin
 from Runtime.Providers.Application import ApplicationProvider
 from Runtime.Providers.Browser import BrowserProvider
 from Runtime.Providers.Media import MediaProvider
+from Runtime.Providers.Spotify import SpotifyProvider
 from Runtime.engine import AgentHarness
 
 
@@ -67,6 +68,7 @@ def test_application_open_and_close_use_owned_window_only(tmp_path):
     write_registry(tmp_path)
     snapshots = iter([
         [],
+        [{"handle": 7, "pid": 42, "title": "Untitled - Notepad"}],
         [{"handle": 7, "pid": 42, "title": "Untitled - Notepad"}],
     ])
     closed = []
@@ -152,6 +154,23 @@ def test_application_close_without_owned_window_fails_closed(tmp_path):
     assert result["error"] == "NO_OWNED_WINDOW"
 
 
+def test_application_close_rejects_reused_handle_from_other_process(tmp_path):
+    write_registry(tmp_path)
+    closed = []
+    provider = ApplicationProvider(
+        tmp_path / "applications.json",
+        observer=lambda: [{"handle": 7, "pid": 999, "title": "Other process"}],
+        closer=lambda handle: closed.append(handle) or {"handle": handle, "closed": True},
+    )
+    provider.owned["notepad"] = {"handle": 7, "pid": 42, "title": "Untitled - Notepad"}
+
+    result = provider.close("notepad", execute=True)
+
+    assert result["ok"] is False
+    assert result["error"] == "NO_OWNED_WINDOW"
+    assert closed == []
+
+
 def test_web_open_rejects_browser_outside_registry(tmp_path):
     write_registry(tmp_path)
     opened = []
@@ -203,7 +222,7 @@ def test_media_pause_requires_observed_stopped_state():
 
 
 @pytest.mark.parametrize(("action", "command"), [
-    ("PAUSE", "pause"), ("RESUME", "resume"), ("STOP", "pause"),
+    ("PAUSE", "pause"), ("RESUME", "resume"),
     ("NEXT", "next"), ("PREVIOUS", "previous"),
 ])
 def test_media_provider_runs_all_transport_commands(action, command):
@@ -227,6 +246,58 @@ def test_media_play_uses_registry_default_device(tmp_path):
 
     assert result["ok"] is True
     assert calls == [["play", "One More Time", "--device", "Web Player (Chrome)"]]
+
+
+def test_native_spotify_health_is_checked_at_dispatch_time(tmp_path):
+    for name in ("applications.json", "browsers.json", "media_providers.json"):
+        (tmp_path / name).write_text("[]", encoding="utf-8")
+    (tmp_path / "system.json").write_text("{}", encoding="utf-8")
+    (tmp_path / "providers.json").write_text(json.dumps([{
+        "provider_id": "media.spotify-native", "enabled": True, "priority": 20,
+        "capabilities": ["media.catalog.resolve"],
+    }]), encoding="utf-8")
+    healthy = [False]
+    providers = Builtin.build_builtin_providers(tmp_path, spotify_available=lambda: healthy[0])
+
+    assert providers.available("media.catalog.resolve") is False
+    healthy[0] = True
+    assert providers.available("media.catalog.resolve") is True
+
+
+def test_native_spotify_requires_exact_uri_device_and_readback():
+    class Client:
+        def devices(self):
+            return {"devices": [{"id": "d1", "name": "Web Player", "is_active": True,
+                                  "is_restricted": False}]}
+
+        def start_playback(self, **kwargs):
+            assert kwargs == {"device_id": "d1", "uris": ["spotify:track:abc"]}
+
+        def current_playback(self):
+            return {"is_playing": True, "item": {"uri": "spotify:track:abc"},
+                    "device": {"id": "d1", "name": "Web Player"}}
+
+    provider = SpotifyProvider(client_factory=Client)
+    assert provider.resolve({"query": "https://open.spotify.com/track/abc?si=x"})["uri"] == "spotify:track:abc"
+    assert provider.play({"query": "raw"}, True)["error"] == "RESOURCE_CONTRACT_VIOLATION"
+    assert provider.play({"uri": "spotify:track:abc"}, True)["observed"]["device_id"] == "d1"
+
+
+def test_native_spotify_readback_exception_preserves_started_state():
+    class Client:
+        def devices(self):
+            return {"devices": [{"id": "d1", "is_active": True, "is_restricted": False}]}
+
+        def start_playback(self, **_kwargs):
+            pass
+
+        def current_playback(self):
+            raise ValueError("readback failed")
+
+    assert SpotifyProvider(client_factory=Client).play({"uri": "spotify:track:abc"}, True) == {
+        "ok": False, "error": "EXECUTION_FAILED", "side_effect_state": "STARTED",
+        "message": "readback failed",
+    }
 
 
 def test_application_close_requires_confirmation(tmp_path):

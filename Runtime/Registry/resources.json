@@ -93,6 +93,41 @@
       "operation": "application.control.open"
     },
     {
+      "resource_id": "web.search.build_url",
+      "enabled": true,
+      "domain": "web",
+      "risk": "NONE",
+      "operation": "web.search.build_url",
+      "arguments": {
+        "query": {
+          "type": "string",
+          "required": true
+        },
+        "engine": {
+          "type": "string",
+          "required": false
+        }
+      },
+      "result": {
+        "ok": {
+          "type": "boolean",
+          "required": true
+        },
+        "url": {
+          "type": "string",
+          "required_on_success": true
+        },
+        "engine": {
+          "type": "string",
+          "required_on_success": true
+        },
+        "error": {
+          "type": "string",
+          "required": false
+        }
+      }
+    },
+    {
       "resource_id": "browser.navigation.open",
       "enabled": true,
       "domain": "browser",
@@ -125,7 +160,7 @@
     },
     {
       "resource_id": "browser.window.close",
-      "enabled": true,
+      "enabled": false,
       "domain": "browser",
       "risk": "MEDIUM",
       "operation": "browser.window.close",
@@ -219,13 +254,17 @@
       "risk": "LOW",
       "operation": "media.playback.play",
       "arguments": {
+        "uri": {
+          "type": "string",
+          "required": true
+        },
         "platform": {
           "type": "string",
-          "required": false
-        },
-        "query": {
-          "type": "string",
-          "required": false
+          "required": false,
+          "enum": [
+            "SPOTIFY",
+            "DEFAULT"
+          ]
         }
       },
       "result": {
@@ -233,13 +272,9 @@
           "type": "boolean",
           "required": true
         },
-        "provider": {
-          "type": "string",
-          "required_on_success": true
-        },
         "observed": {
           "type": "object",
-          "required": false
+          "required_on_success": true
         },
         "error": {
           "type": "string",
@@ -311,7 +346,7 @@
     },
     {
       "resource_id": "media.playback.stop",
-      "enabled": true,
+      "enabled": false,
       "domain": "media",
       "risk": "LOW",
       "operation": "media.playback.stop",
@@ -474,6 +509,306 @@
           "required": true
         },
         "evidence": {
+          "type": "object",
+          "required_on_success": true
+        },
+        "error": {
+          "type": "string",
+          "required": false
+        }
+      }
+    },
+    {
+      "resource_id": "browser.navigation.history",
+      "enabled": false,
+      "domain": "browser",
+      "risk": "LOW",
+      "operation": "browser.navigation.history",
+      "arguments": {
+        "action": {
+          "type": "string",
+          "required": true,
+          "enum": [
+            "BACK",
+            "FORWARD"
+          ]
+        }
+      },
+      "result": {
+        "ok": {
+          "type": "boolean",
+          "required": true
+        },
+        "evidence": {
+          "type": "object",
+          "required_on_success": true
+        },
+        "error": {
+          "type": "string",
+          "required": false
+        }
+      }
+    },
+    {
+      "resource_id": "browser.navigation.refresh",
+      "enabled": false,
+      "domain": "browser",
+      "risk": "LOW",
+      "operation": "browser.navigation.refresh",
+      "arguments": {},
+      "result": {
+        "ok": {
+          "type": "boolean",
+          "required": true
+        },
+        "evidence": {
+          "type": "object",
+          "required_on_success": true
+        },
+        "error": {
+          "type": "string",
+          "required": false
+        }
+      }
+    },
+    {
+      "resource_id": "browser.navigation.scroll",
+      "enabled": false,
+      "domain": "browser",
+      "risk": "LOW",
+      "operation": "browser.navigation.scroll",
+      "arguments": {
+        "direction": {
+          "type": "string",
+          "required": true,
+          "enum": [
+            "UP",
+            "DOWN"
+          ]
+        },
+        "amount": {
+          "type": "integer",
+          "required": true,
+          "minimum": 1,
+          "maximum": 10
+        }
+      },
+      "result": {
+        "ok": {
+          "type": "boolean",
+          "required": true
+        },
+        "evidence": {
+          "type": "object",
+          "required_on_success": true
+        },
+        "error": {
+          "type": "string",
+          "required": false
+        }
+      }
+    },
+    {
+      "resource_id": "browser.tab.resolve",
+      "enabled": false,
+      "domain": "browser",
+      "risk": "NONE",
+      "operation": "browser.tab.resolve",
+      "arguments": {
+        "active": {
+          "type": "boolean",
+          "required": false
+        },
+        "tab_index": {
+          "type": "integer",
+          "required": false
+        },
+        "tab_reference": {
+          "type": "string",
+          "required": false
+        }
+      },
+      "exactly_one_of": [
+        "active",
+        "tab_index",
+        "tab_reference"
+      ],
+      "result": {
+        "ok": {
+          "type": "boolean",
+          "required": true
+        },
+        "browser_session_id": {
+          "type": "string",
+          "required_on_success": true
+        },
+        "window_id": {
+          "type": "string",
+          "required_on_success": true
+        },
+        "tab_id": {
+          "type": "string",
+          "required_on_success": true
+        },
+        "owned": {
+          "type": "boolean",
+          "required_on_success": true
+        },
+        "error": {
+          "type": "string",
+          "required": false
+        }
+      }
+    },
+    {
+      "resource_id": "browser.tab.create",
+      "enabled": false,
+      "domain": "browser",
+      "risk": "LOW",
+      "operation": "browser.tab.create",
+      "arguments": {},
+      "result": {
+        "ok": {
+          "type": "boolean",
+          "required": true
+        },
+        "evidence": {
+          "type": "object",
+          "required_on_success": true
+        },
+        "error": {
+          "type": "string",
+          "required": false
+        }
+      }
+    },
+    {
+      "resource_id": "browser.tab.close",
+      "enabled": false,
+      "domain": "browser",
+      "risk": "MEDIUM",
+      "operation": "browser.tab.close",
+      "arguments": {
+        "browser_session_id": {
+          "type": "string",
+          "required": true
+        },
+        "window_id": {
+          "type": "string",
+          "required": true
+        },
+        "tab_id": {
+          "type": "string",
+          "required": true
+        }
+      },
+      "result": {
+        "ok": {
+          "type": "boolean",
+          "required": true
+        },
+        "evidence": {
+          "type": "object",
+          "required_on_success": true
+        },
+        "error": {
+          "type": "string",
+          "required": false
+        }
+      }
+    },
+    {
+      "resource_id": "browser.tab.switch",
+      "enabled": false,
+      "domain": "browser",
+      "risk": "LOW",
+      "operation": "browser.tab.switch",
+      "arguments": {
+        "browser_session_id": {
+          "type": "string",
+          "required": true
+        },
+        "window_id": {
+          "type": "string",
+          "required": true
+        },
+        "tab_id": {
+          "type": "string",
+          "required": true
+        }
+      },
+      "result": {
+        "ok": {
+          "type": "boolean",
+          "required": true
+        },
+        "evidence": {
+          "type": "object",
+          "required_on_success": true
+        },
+        "error": {
+          "type": "string",
+          "required": false
+        }
+      }
+    },
+    {
+      "resource_id": "browser.tab.reopen",
+      "enabled": false,
+      "domain": "browser",
+      "risk": "LOW",
+      "operation": "browser.tab.reopen",
+      "arguments": {},
+      "ownership_rule": "most_recent_tab_closed_by_valls_in_current_runtime_session",
+      "result": {
+        "ok": {
+          "type": "boolean",
+          "required": true
+        },
+        "evidence": {
+          "type": "object",
+          "required_on_success": true
+        },
+        "error": {
+          "type": "string",
+          "required": false
+        }
+      }
+    },
+    {
+      "resource_id": "media.catalog.resolve",
+      "enabled": true,
+      "domain": "media",
+      "risk": "NONE",
+      "operation": "media.catalog.resolve",
+      "arguments": {
+        "query": {
+          "type": "string",
+          "required": true
+        },
+        "platform": {
+          "type": "string",
+          "required": false,
+          "enum": [
+            "SPOTIFY",
+            "DEFAULT"
+          ]
+        }
+      },
+      "result": {
+        "ok": {
+          "type": "boolean",
+          "required": true
+        },
+        "uri": {
+          "type": "string",
+          "required_on_success": true
+        },
+        "media_type": {
+          "type": "string",
+          "required_on_success": true
+        },
+        "item": {
           "type": "object",
           "required_on_success": true
         },

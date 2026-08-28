@@ -4,6 +4,14 @@
   "ontology_release_version": "0.0.4",
   "items": [
     {
+      "provider_id": "builtin.web-search",
+      "enabled": true,
+      "priority": 10,
+      "capabilities": [
+        "web.search.build_url"
+      ]
+    },
+    {
       "provider_id": "application.catalog.builtin",
       "enabled": true,
       "priority": 10,
@@ -29,11 +37,12 @@
       ]
     },
     {
-      "provider_id": "browser.window.windows",
+      "provider_id": "media.spotify-native",
       "enabled": true,
-      "priority": 10,
+      "priority": 20,
       "capabilities": [
-        "browser.window.close"
+        "media.catalog.resolve",
+        "media.playback.play"
       ]
     },
     {
@@ -41,10 +50,8 @@
       "enabled": true,
       "priority": 10,
       "capabilities": [
-        "media.playback.play",
         "media.playback.pause",
         "media.playback.resume",
-        "media.playback.stop",
         "media.playback.next",
         "media.playback.previous"
       ]

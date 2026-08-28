@@ -17,7 +17,7 @@ ROUTES: dict[tuple[str, str | None], str | None] = {
     ("MEDIA_CONTROL", "VOLUME_DOWN"): None,
     ("MEDIA_CONTROL", "SET_VOLUME"): None,
     ("WEB_OPEN", None): "web.open",
-    ("WEB_SEARCH", None): None,
+    ("WEB_SEARCH", None): "web.search",
     ("WEB_NAVIGATE", "BACK"): None,
     ("WEB_NAVIGATE", "FORWARD"): None,
     ("WEB_NAVIGATE", "REFRESH"): None,

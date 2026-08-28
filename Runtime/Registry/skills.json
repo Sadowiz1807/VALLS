@@ -126,9 +126,54 @@
       ]
     },
     {
+      "skill_id": "web.search",
+      "description": "Build an allowlisted search URL and open it",
+      "enabled": true,
+      "semantically_reachable": true,
+      "accepts": {
+        "act": [
+          "EXECUTE"
+        ],
+        "goal": "WEB_SEARCH"
+      },
+      "inputs": {
+        "query": {
+          "type": "string",
+          "required": true
+        },
+        "engine": {
+          "type": "string",
+          "required": false
+        }
+      },
+      "resources": [
+        "web.search.build_url",
+        "browser.navigation.open"
+      ],
+      "risk": "LOW",
+      "confirmation_required": false,
+      "steps": [
+        {
+          "id": "build_url",
+          "use": "web.search.build_url",
+          "with": {
+            "query": "$inputs.query",
+            "engine": "$inputs.engine"
+          }
+        },
+        {
+          "id": "open_url",
+          "use": "browser.navigation.open",
+          "with": {
+            "url": "$steps.build_url.result.url"
+          }
+        }
+      ]
+    },
+    {
       "skill_id": "web.close",
       "description": "Đóng đúng cửa sổ web theo title whitelist",
-      "enabled": true,
+      "enabled": false,
       "accepts": {
         "act": [
           "EXECUTE"
@@ -170,10 +215,29 @@
         }
       },
       "resources": [
+        "media.catalog.resolve",
         "media.playback.play"
       ],
       "risk": "LOW",
-      "confirmation_required": false
+      "confirmation_required": false,
+      "steps": [
+        {
+          "id": "resolve",
+          "use": "media.catalog.resolve",
+          "with": {
+            "query": "$inputs.query",
+            "platform": "$inputs.platform"
+          }
+        },
+        {
+          "id": "play",
+          "use": "media.playback.play",
+          "with": {
+            "uri": "$steps.resolve.result.uri",
+            "platform": "$inputs.platform"
+          }
+        }
+      ]
     },
     {
       "skill_id": "media.transport",
@@ -217,6 +281,14 @@
         "STOP": "media.playback.stop",
         "NEXT": "media.playback.next",
         "PREVIOUS": "media.playback.previous"
+      },
+      "unavailable_actions_by_platform": {
+        "SPOTIFY": [
+          "STOP"
+        ],
+        "DEFAULT": [
+          "STOP"
+        ]
       }
     },
     {

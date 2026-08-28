@@ -267,6 +267,11 @@ class AgentHarness:
             if isinstance(target, dict):
                 target = target.get("value", "")
             arguments = {"target": target or raw_input, "browser": params.get("browser")}
+        elif skill_id == "web.search":
+            query = params.get("query", "")
+            if isinstance(query, dict):
+                query = query.get("value", "")
+            arguments = {"query": query, "engine": params.get("engine", "GOOGLE")}
         elif skill_id == "media.play":
             query = params.get("query", "")
             if isinstance(query, dict):

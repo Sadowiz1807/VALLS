@@ -73,6 +73,10 @@ class SkillExecutor:
         accepted = [accepted] if isinstance(accepted, str) else accepted
         if action is not None and accepted and action not in accepted:
             return {"ok": False, "skill_id": skill_id, "error": "ACTION_UNSUPPORTED"}
+        platform = str(arguments.get("platform", "DEFAULT")).upper()
+        unavailable = skill.get("unavailable_actions_by_platform", {}).get(platform, [])
+        if action in unavailable:
+            return {"ok": False, "skill_id": skill_id, "error": "SKILL_NOT_AVAILABLE"}
 
         confirmation_required = skill.get("confirmation_required", False)
         confirmation_required = skill.get("confirmation_required_by_action", {}).get(action, confirmation_required)

@@ -11,7 +11,9 @@ from Runtime.Providers.Application import ApplicationProvider
 from Runtime.Providers.Browser import BrowserProvider
 from Runtime.Providers.Media import MediaProvider
 from Runtime.Providers.Registry import ProviderRegistry
+from Runtime.Providers.Spotify import SpotifyProvider
 from Runtime.Providers.System import SystemProvider
+from Runtime.Providers.Web import build_search_url
 from Runtime.Contracts.Validate import BUILTIN_PROVIDER_IDS, RegistryValidationError, load_manifest
 from Runtime.Resources.Registry import resolve
 
@@ -19,7 +21,7 @@ from Runtime.Resources.Registry import resolve
 def _dependency_available(name: str) -> bool:
     modules = {
         "application.windows": ("win32gui", "win32process"),
-        "browser.window": ("win32gui", "pywinauto"),
+
         "system.volume": ("pycaw",),
         "system.night_light": ("pywinauto",),
     }
@@ -37,6 +39,7 @@ def build_builtin_providers(
     runner: Callable = subprocess.Popen,
     web_opener: Callable | None = None,
     media_available: Callable[[], bool] = MediaProvider.available,
+    spotify_available: Callable[[], bool] = SpotifyProvider.available,
     dependency_available: Callable[[str], bool] = _dependency_available,
 ) -> ProviderRegistry:
     application = ApplicationProvider(registry_dir / "applications.json", runner=runner)
@@ -45,15 +48,19 @@ def build_builtin_providers(
         **({"opener": web_opener} if web_opener else {}),
     )
     media = MediaProvider(registry_dir / "media_providers.json")
+    spotify = SpotifyProvider()
     system = SystemProvider(registry_dir / "system.json")
 
     def playback(command: str):
         return lambda args, execute: media.run(
-            [command, args.get("query", "")] if command == "play" else ["pause" if command == "stop" else command],
+            [command],
             args.get("platform", "spotify"), execute,
         )
 
     implementations = {
+        "builtin.web-search": ({
+            "web.search.build_url": build_search_url,
+        }, True),
         "application.catalog.builtin": ({
             "application.catalog.resolve": lambda args, _execute: _resolve_application(registry_dir, args),
         }, True),
@@ -64,12 +71,13 @@ def build_builtin_providers(
         "browser.navigation.windows": ({
             "browser.navigation.open": lambda args, execute: browser.open(args.get("url", ""), args.get("browser"), execute),
         }, dependency_available("browser.navigation")),
-        "browser.window.windows": ({
-            "browser.window.close": lambda args, execute: browser.close_title(args.get("title", ""), execute),
-        }, dependency_available("browser.window")),
+
+        "media.spotify-native": ({
+            "media.catalog.resolve": spotify.resolve,
+            "media.playback.play": spotify.play,
+        }, spotify_available()),
         "media.spotify": ({resource_id: playback(command) for resource_id, command in {
-            "media.playback.play": "play", "media.playback.pause": "pause",
-            "media.playback.resume": "resume", "media.playback.stop": "stop",
+            "media.playback.pause": "pause", "media.playback.resume": "resume",
             "media.playback.next": "next", "media.playback.previous": "previous",
         }.items()}, media_available()),
         "system.power.windows": ({
@@ -101,11 +109,13 @@ def build_builtin_providers(
             resource_id: implementation[resource_id]
             for resource_id in declaration.get("capabilities", []) if resource_id in implementation
         }
+        dynamic_health = provider_id in {"media.spotify", "media.spotify-native"}
         providers.register(
             provider_id, capabilities,
-            available=bool(declaration.get("enabled", False) and (healthy if provider_id != "media.spotify" else True)),
+            available=bool(declaration.get("enabled", False) and (True if dynamic_health else healthy)),
             priority=int(declaration.get("priority", 0)),
-            health=(lambda _resource: media_available()) if provider_id == "media.spotify" else None,
+            health=((lambda _resource: media_available()) if provider_id == "media.spotify"
+                    else (lambda _resource: spotify_available()) if provider_id == "media.spotify-native" else None),
         )
     return providers
 

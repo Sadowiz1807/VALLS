@@ -98,6 +98,11 @@ class ApplicationProvider:
         owned = self.owned.get(app["app_id"])
         if not owned:
             return {"ok": False, "resource_id": "application.control.close", "resolved": app["app_id"], "error": "NO_OWNED_WINDOW"}
+        current = next((window for window in self.observer()
+                        if window.get("handle") == owned.get("handle")), None)
+        if not current or current.get("pid") != owned.get("pid"):
+            self.owned.pop(app["app_id"], None)
+            return {"ok": False, "resource_id": "application.control.close", "resolved": app["app_id"], "error": "NO_OWNED_WINDOW"}
         try:
             evidence = self.closer(owned["handle"])
             self.owned.pop(app["app_id"], None)

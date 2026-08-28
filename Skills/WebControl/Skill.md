@@ -5,7 +5,7 @@ version: 1.0.0
 platforms: [windows]
 metadata:
   family: WebControl
-  workflow_ids: [web.open, web.close]
+  workflow_ids: [web.open]
 ---
 
 # Web Control
@@ -38,14 +38,7 @@ Reference phrases: “mở Spotify trên web”, “mở Facebook qua Cốc Cố
 
 Risk: LOW. Confirmation: no.
 
-### `web.close`
-
-1. Resolve a web entity and its Registry-owned window title.
-2. Find one matching browser window.
-3. Close every matching browser tab through its native UI Automation `TabCloseButton`.
-4. Report success only after no matching tab remains. Never kill the browser process.
-
-Risk: MEDIUM. Confirmation: no for a web tab.
+`web.close` bị disable cho đến khi Runtime chứng minh exact browser-session/tab ownership; title-only UIA không được expose.
 
 ## Result contract
 
@@ -64,4 +57,3 @@ Return `skill_id=web.open`, `resource_id=browser.navigation.open`, `ok`, destina
 - Approved Spotify + Cốc Cốc → open Registry URL with Registry executable.
 - Firefox absent from Registry → `BROWSER_UNSUPPORTED`, no fallback.
 - Facebook + Cốc Cốc → open `https://www.facebook.com` with the configured Cốc Cốc executable.
-- Close YouTube → close all YouTube tabs while preserving Cốc Cốc and unrelated tabs.

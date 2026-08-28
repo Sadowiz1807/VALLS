@@ -71,6 +71,28 @@ semantic frame
 → observed result
 ```
 
+### 2.2 Browser transport inventory
+
+| Transport | Artifact/process owner | Health probe | Mutation | Trạng thái |
+|---|---|---|---|---|
+| Extension | Không tìm thấy package, manifest, native host hoặc bridge | Không có | Không | `BLOCKED_ARTIFACT_NOT_FOUND` |
+| CDP | Không có Runtime-owned Chromium session/profile contract | Không có | Không | `BLOCKED_SESSION_CONTRACT_NOT_FOUND` |
+| UIA | `Runtime/Providers/Browser.py`; current Runtime process không sở hữu browser session | Không có ownership probe đủ mạnh cho mutation | Không expose title-only close | `BLOCKED_OWNERSHIP_NOT_PROVEN` |
+
+Không register Extension/CDP placeholder. UIA healthy không đồng nghĩa hỗ trợ mọi browser resource; title-only identity không đủ quyền mutate/close.
+
+### 2.3 Capability và UAT hiện tại
+
+| Capability | Implementation | Semantic | Evidence |
+|---|---|---|---|
+| `WEB_SEARCH` | stdlib URL builder + existing browser open | reachable | automated GREEN; session-only Chrome observation, chưa có durable UAT artifact |
+| Browser navigate/tab session | typed declarations `enabled=false` | blocked | thiếu Runtime-owned transport/session |
+| Application open/close | Windows provider, session-local PID/window ownership | reachable theo route hiện có | deterministic ownership/reused-handle tests GREEN |
+| Spotify PLAY | native Spotipy resolve → exact URI → playback → read-back | reachable khi provider healthy | automated GREEN; live UAT blocked vì không có active Connect target |
+| Spotify STOP | không implement | fail-closed trước Dispatcher | `SKILL_NOT_AVAILABLE`, zero attempts |
+| Voice VAD/STT | NumPy RMS VAD, half-duplex capture lifecycle | internal input pipeline | deterministic lifecycle/VAD tests GREEN; mic/model UAT chưa chạy |
+| Windows master volume | không implement qua media | blocked | ontology migration chưa có |
+
 Public ID dùng lowercase dot notation; tên class, language và package của provider là implementation detail.
 
 ## 3. Ranh giới Model và Runtime
@@ -327,7 +349,7 @@ Local embedding là optional optimization; skill system không phụ thuộc m�
 | Skill ID | Semantic compatibility | Inputs | Resources | Workflow |
 |---|---|---|---|---|
 | `web.open` | `WEB_OPEN` | `target`, optional `browser` | browser state/navigation | resolve browser/target → open |
-| `web.search` | `WEB_SEARCH` | — | — | Chưa có runtime workflow; fail closed |
+| `web.search` | `WEB_SEARCH` | `query`, optional `engine` | search URL builder, browser navigation | build allowlisted URL → open |
 | `web.navigate` | `WEB_NAVIGATE` | — | — | Chưa có runtime workflow; fail closed |
 | `tab.manage` | `TAB_CONTROL` | — | — | Chưa có runtime workflow; fail closed |
 
