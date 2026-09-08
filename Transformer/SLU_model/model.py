@@ -1,141 +1,114 @@
-"""Independent shared encoder and closed multi-task prediction heads."""
+"""Neural modules for the voice-native VALLS SLU Model V0.
+
+The model owns the audio-to-semantic path only.  It emits an untrusted
+semantic prediction; validation, registry resolution, policy and execution
+remain outside this module.
+"""
 
 from __future__ import annotations
 
 import math
-from typing import Any, Callable
+from typing import Any, Mapping
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch import Tensor
 from torch.utils.checkpoint import checkpoint
 
+from .config import validate_config
 
-class TokenEmbedding(nn.Module):
-    def __init__(self, vocab_size: int, d_model: int) -> None:
+
+class LayerNorm(nn.Module):
+    """Small explicit LayerNorm kept local so the model has one dependency."""
+
+    def __init__(self, d_model: int, eps: float = 1e-5) -> None:
         super().__init__()
-        self.d_model = d_model
-        self.embedding = nn.Embedding(vocab_size, d_model)
+        self.weight = nn.Parameter(torch.ones(d_model))
+        self.bias = nn.Parameter(torch.zeros(d_model))
+        self.eps = eps
 
-    def forward(self, token_ids: Tensor) -> Tensor:
-        return self.embedding(token_ids) * math.sqrt(self.d_model)
+    def forward(self, hidden_states: Tensor) -> Tensor:
+        return F.layer_norm(
+            hidden_states,
+            (hidden_states.size(-1),),
+            self.weight,
+            self.bias,
+            self.eps,
+        )
 
 
 class PositionalEncoding(nn.Module):
-    def __init__(self, d_model: int, max_length: int, dropout: float) -> None:
+    """Sinusoidal position encoding for variable-length frame sequences."""
+
+    def __init__(self, d_model: int, max_length: int = 4096) -> None:
         super().__init__()
         positions = torch.arange(max_length, dtype=torch.float32).unsqueeze(1)
         frequencies = torch.exp(
             torch.arange(0, d_model, 2, dtype=torch.float32)
-            * (-(math.log(10_000.0) / d_model))
+            * (-math.log(10_000.0) / d_model)
         )
         encoding = torch.zeros(max_length, d_model)
         encoding[:, 0::2] = torch.sin(positions * frequencies)
         encoding[:, 1::2] = torch.cos(
             positions * frequencies[: encoding[:, 1::2].shape[1]]
         )
-        self.max_length = max_length
-        self.dropout = nn.Dropout(dropout)
         self.register_buffer("encoding", encoding.unsqueeze(0), persistent=True)
 
-    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs):
-        # Tự động điều chỉnh kích thước buffer encoding khi max_length thay đổi
-        key = prefix + "encoding"
-        if key in state_dict:
-            ckpt_encoding = state_dict[key]
-            if ckpt_encoding.shape != self.encoding.shape:
-                # Dùng buffer đã tính toán động theo max_length mới để pass strict check
-                state_dict[key] = self.encoding.clone()
-        super()._load_from_state_dict(state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs)
-
     def forward(self, hidden_states: Tensor) -> Tensor:
-        if hidden_states.size(1) > self.max_length:
-            raise ValueError("Sequence exceeds configured maximum length")
-        return self.dropout(
-            hidden_states
-            + self.encoding[:, : hidden_states.size(1)].to(dtype=hidden_states.dtype)
-        )
-
-
-class LayerNormalization(nn.Module):
-    def __init__(self, d_model: int, eps: float = 1e-6) -> None:
-        super().__init__()
-        self.scale = nn.Parameter(torch.ones(d_model))
-        self.bias = nn.Parameter(torch.zeros(d_model))
-        self.eps = eps
-
-    def forward(self, hidden_states: Tensor) -> Tensor:
-        mean = hidden_states.mean(dim=-1, keepdim=True)
-        variance = hidden_states.var(dim=-1, keepdim=True, unbiased=False)
-        return self.scale * (hidden_states - mean) / torch.sqrt(variance + self.eps) + self.bias
+        length = hidden_states.size(1)
+        if length > self.encoding.size(1):
+            raise ValueError("sequence exceeds positional encoding capacity")
+        return hidden_states + self.encoding[:, :length].to(hidden_states)
 
 
 class MultiHeadAttention(nn.Module):
+    """Self/cross attention using a boolean valid-key mask."""
+
     def __init__(self, d_model: int, heads: int, dropout: float) -> None:
         super().__init__()
         if d_model % heads:
             raise ValueError("d_model must be divisible by attention heads")
+        self.d_model = d_model
         self.heads = heads
         self.head_size = d_model // heads
-        self.d_model = d_model
         self.query = nn.Linear(d_model, d_model)
         self.key = nn.Linear(d_model, d_model)
         self.value = nn.Linear(d_model, d_model)
         self.output = nn.Linear(d_model, d_model)
         self.dropout = nn.Dropout(dropout)
 
-    def _split(self, tensor: Tensor) -> Tensor:
-        batch, length, _ = tensor.shape
-        return tensor.view(batch, length, self.heads, self.head_size).transpose(1, 2)
+    def _split(self, values: Tensor) -> Tensor:
+        batch, length, _ = values.shape
+        return values.view(batch, length, self.heads, self.head_size).transpose(1, 2)
 
-    def forward(self, hidden_states: Tensor, mask: Tensor | None) -> Tensor:
-        query = self._split(self.query(hidden_states))
-        key = self._split(self.key(hidden_states))
-        value = self._split(self.value(hidden_states))
-        scores = query @ key.transpose(-2, -1) / math.sqrt(self.head_size)
-        if mask is not None:
-            scores = scores.masked_fill(
-                ~mask.to(device=scores.device, dtype=torch.bool),
-                torch.finfo(scores.dtype).min,
-            )
-        attended = self.dropout(scores.softmax(-1)) @ value
-        attended = attended.transpose(1, 2).contiguous().view(
-            hidden_states.size(0), hidden_states.size(1), self.d_model
-        )
-        return self.output(attended)
+    @staticmethod
+    def _normalise_mask(mask: Tensor | None, batch: int, keys: int) -> Tensor | None:
+        if mask is None:
+            return None
+        if mask.dim() == 2:
+            if mask.shape != (batch, keys):
+                raise ValueError("attention mask must have shape [batch, key_length]")
+            return mask[:, None, None, :].bool()
+        if mask.dim() == 4:
+            return mask.bool()
+        raise ValueError("attention mask must have rank 2 or 4")
 
-
-class CrossAttention(nn.Module):
-    """Multi-head attention from decoder queries to encoder memory."""
-
-    def __init__(self, d_model: int, heads: int, dropout: float) -> None:
-        super().__init__()
-        if d_model % heads:
-            raise ValueError("d_model must be divisible by attention heads")
-        self.heads = heads
-        self.head_size = d_model // heads
-        self.d_model = d_model
-        self.query = nn.Linear(d_model, d_model)
-        self.key = nn.Linear(d_model, d_model)
-        self.value = nn.Linear(d_model, d_model)
-        self.output = nn.Linear(d_model, d_model)
-        self.dropout = nn.Dropout(dropout)
-
-    def _split(self, tensor: Tensor) -> Tensor:
-        batch, length, _ = tensor.shape
-        return tensor.view(batch, length, self.heads, self.head_size).transpose(1, 2)
-
-    def forward(self, query_states: Tensor, memory: Tensor, memory_mask: Tensor | None) -> Tensor:
+    def forward(
+        self,
+        query_states: Tensor,
+        key_states: Tensor,
+        value_states: Tensor,
+        key_mask: Tensor | None = None,
+    ) -> Tensor:
         query = self._split(self.query(query_states))
-        key = self._split(self.key(memory))
-        value = self._split(self.value(memory))
+        key = self._split(self.key(key_states))
+        value = self._split(self.value(value_states))
         scores = query @ key.transpose(-2, -1) / math.sqrt(self.head_size)
-        if memory_mask is not None:
-            scores = scores.masked_fill(
-                ~memory_mask.to(device=scores.device, dtype=torch.bool),
-                torch.finfo(scores.dtype).min,
-            )
-        attended = self.dropout(scores.softmax(-1)) @ value
+        valid = self._normalise_mask(key_mask, query_states.size(0), key_states.size(1))
+        if valid is not None:
+            scores = scores.masked_fill(~valid, torch.finfo(scores.dtype).min)
+        attended = self.dropout(scores.softmax(dim=-1)) @ value
         attended = attended.transpose(1, 2).contiguous().view(
             query_states.size(0), query_states.size(1), self.d_model
         )
@@ -145,44 +118,50 @@ class CrossAttention(nn.Module):
 class FeedForward(nn.Module):
     def __init__(self, d_model: int, d_ff: int, dropout: float) -> None:
         super().__init__()
-        self.layers = nn.Sequential(
-            nn.Linear(d_model, d_ff), nn.GELU(), nn.Dropout(dropout), nn.Linear(d_ff, d_model)
+        self.network = nn.Sequential(
+            nn.Linear(d_model, d_ff),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_ff, d_model),
+            nn.Dropout(dropout),
         )
 
     def forward(self, hidden_states: Tensor) -> Tensor:
-        return self.layers(hidden_states)
+        return self.network(hidden_states)
 
 
-class Residual(nn.Module):
-    def __init__(self, d_model: int, dropout: float) -> None:
-        super().__init__()
-        self.norm = LayerNormalization(d_model)
-        self.dropout = nn.Dropout(dropout)
+class TransformerBlock(nn.Module):
+    """Pre-norm transformer block for sequence self-attention."""
 
-    def forward(self, hidden_states: Tensor, layer: Callable[[Tensor], Tensor]) -> Tensor:
-        return hidden_states + self.dropout(layer(self.norm(hidden_states)))
-
-
-class EncoderBlock(nn.Module):
     def __init__(self, d_model: int, heads: int, d_ff: int, dropout: float) -> None:
         super().__init__()
+        self.norm_attention = LayerNorm(d_model)
         self.attention = MultiHeadAttention(d_model, heads, dropout)
+        self.norm_feed_forward = LayerNorm(d_model)
         self.feed_forward = FeedForward(d_model, d_ff, dropout)
-        self.attention_residual = Residual(d_model, dropout)
-        self.feed_forward_residual = Residual(d_model, dropout)
+        self.dropout = nn.Dropout(dropout)
 
     def forward(self, hidden_states: Tensor, mask: Tensor | None) -> Tensor:
-        hidden_states = self.attention_residual(
-            hidden_states, lambda states: self.attention(states, mask)
+        normalised = self.norm_attention(hidden_states)
+        hidden_states = hidden_states + self.dropout(
+            self.attention(normalised, normalised, normalised, mask)
         )
-        return self.feed_forward_residual(hidden_states, self.feed_forward)
+        hidden_states = hidden_states + self.dropout(
+            self.feed_forward(self.norm_feed_forward(hidden_states))
+        )
+        return hidden_states
 
 
-class Encoder(nn.Module):
-    def __init__(self, layers: nn.ModuleList, d_model: int, gradient_checkpointing: bool) -> None:
+class TransformerEncoder(nn.Module):
+    def __init__(
+        self,
+        layers: nn.ModuleList,
+        d_model: int,
+        gradient_checkpointing: bool = False,
+    ) -> None:
         super().__init__()
         self.layers = layers
-        self.norm = LayerNormalization(d_model)
+        self.norm = LayerNorm(d_model)
         self.gradient_checkpointing = gradient_checkpointing
 
     def forward(self, hidden_states: Tensor, mask: Tensor | None) -> Tensor:
@@ -198,103 +177,386 @@ class Encoder(nn.Module):
         return self.norm(hidden_states)
 
 
-class DecoderBlock(nn.Module):
-    """Pre-norm autoregressive block with causal self-attention and encoder cross-attention."""
+class LogMelFrontend(nn.Module):
+    """Convert mono waveforms to log-mel features without torchaudio."""
 
-    def __init__(self, d_model: int, heads: int, d_ff: int, dropout: float) -> None:
+    def __init__(self, audio_config: Mapping[str, Any]) -> None:
         super().__init__()
-        self.self_attention = MultiHeadAttention(d_model, heads, dropout)
-        self.cross_attention = CrossAttention(d_model, heads, dropout)
-        self.feed_forward = FeedForward(d_model, d_ff, dropout)
-        self.self_residual = Residual(d_model, dropout)
-        self.cross_residual = Residual(d_model, dropout)
-        self.feed_forward_residual = Residual(d_model, dropout)
+        self.sample_rate = int(audio_config["sample_rate"])
+        self.n_fft = int(audio_config["n_fft"])
+        self.hop_length = int(audio_config["hop_length"])
+        self.win_length = int(audio_config["win_length"])
+        self.feature_dim = int(audio_config["feature_dim"])
+        self.f_min = float(audio_config.get("f_min", 0.0))
+        self.f_max = float(audio_config.get("f_max", self.sample_rate / 2))
+        self.register_buffer("window", torch.hann_window(self.win_length), persistent=False)
+        self.register_buffer(
+            "mel_filterbank",
+            self._build_mel_filterbank(),
+            persistent=True,
+        )
+
+    def _build_mel_filterbank(self) -> Tensor:
+        def hz_to_mel(value: Tensor) -> Tensor:
+            return 2595.0 * torch.log10(1.0 + value / 700.0)
+
+        def mel_to_hz(value: Tensor) -> Tensor:
+            return 700.0 * (10.0 ** (value / 2595.0) - 1.0)
+
+        low = hz_to_mel(torch.tensor(self.f_min))
+        high = hz_to_mel(torch.tensor(min(self.f_max, self.sample_rate / 2)))
+        points = torch.linspace(low, high, self.feature_dim + 2)
+        frequencies = mel_to_hz(points)
+        bins = torch.floor((self.n_fft + 1) * frequencies / self.sample_rate).long()
+        filters = torch.zeros(self.feature_dim, self.n_fft // 2 + 1)
+        for index in range(self.feature_dim):
+            left, centre, right = bins[index:index + 3].tolist()
+            centre = max(centre, left + 1)
+            right = max(right, centre + 1)
+            left = max(0, min(left, filters.size(1) - 1))
+            centre = max(0, min(centre, filters.size(1)))
+            right = max(centre + 1, min(right, filters.size(1)))
+            if centre > left:
+                filters[index, left:centre] = torch.linspace(0, 1, centre - left)
+            if right > centre:
+                filters[index, centre:right] = torch.linspace(1, 0, right - centre)
+        return filters
 
     def forward(
         self,
-        hidden_states: Tensor,
-        memory: Tensor,
-        self_mask: Tensor,
-        memory_mask: Tensor | None,
-    ) -> Tensor:
-        hidden_states = self.self_residual(
-            hidden_states, lambda states: self.self_attention(states, self_mask)
+        waveform: Tensor,
+        audio_mask: Tensor | None = None,
+    ) -> tuple[Tensor, Tensor]:
+        if waveform.dim() != 2:
+            raise ValueError("waveform must have shape [batch, samples]")
+        if waveform.size(1) < 2:
+            raise ValueError("waveform must contain at least two samples")
+        waveform = waveform.float()
+        window = self.window.to(device=waveform.device, dtype=waveform.dtype)
+        spectrum = torch.stft(
+            waveform,
+            n_fft=self.n_fft,
+            hop_length=self.hop_length,
+            win_length=self.win_length,
+            window=window,
+            center=True,
+            return_complex=True,
         )
-        hidden_states = self.cross_residual(
-            hidden_states, lambda states: self.cross_attention(states, memory, memory_mask)
+        power = spectrum.abs().square()
+        mel = torch.einsum(
+            "mf,bft->btm",
+            self.mel_filterbank.to(device=power.device, dtype=power.dtype),
+            power,
         )
-        return self.feed_forward_residual(hidden_states, self.feed_forward)
+        features = torch.log(mel.clamp_min(1e-5))
+        features = (features - features.mean(dim=(1, 2), keepdim=True)) / (
+            features.std(dim=(1, 2), keepdim=True).clamp_min(1e-5)
+        )
+        frames = features.size(1)
+        if audio_mask is None:
+            frame_mask = torch.ones(
+                waveform.size(0), frames, device=waveform.device, dtype=torch.bool
+            )
+        else:
+            if audio_mask.shape != waveform.shape:
+                raise ValueError("audio_mask must have shape [batch, samples]")
+            lengths = audio_mask.long().sum(dim=1)
+            # center=True contributes one valid edge frame; this is conservative
+            # and keeps padded audio from becoming semantic evidence.
+            valid_frames = torch.div(lengths, self.hop_length, rounding_mode="floor") + 1
+            frame_indices = torch.arange(frames, device=waveform.device)[None, :]
+            frame_mask = frame_indices < valid_frames[:, None]
+        return features, frame_mask
 
 
-class Decoder(nn.Module):
-    def __init__(self, layers: nn.ModuleList, d_model: int, gradient_checkpointing: bool) -> None:
+class ConvSubsampling(nn.Module):
+    """Reduce acoustic frame rate before the speech transformer."""
+
+    def __init__(self, feature_dim: int, d_model: int, factor: int = 4) -> None:
         super().__init__()
-        self.layers = layers
-        self.norm = LayerNormalization(d_model)
-        self.gradient_checkpointing = gradient_checkpointing
+        if factor != 4:
+            raise ValueError("V0 ConvSubsampling currently requires factor=4")
+        channels = max(8, d_model // 2)
+        frequency = math.ceil(math.ceil(feature_dim / 2) / 2)
+        self.network = nn.Sequential(
+            nn.Conv2d(1, channels, kernel_size=3, stride=2, padding=1),
+            nn.GELU(),
+            nn.Conv2d(channels, channels, kernel_size=3, stride=2, padding=1),
+            nn.GELU(),
+        )
+        self.projection = nn.Linear(channels * frequency, d_model)
 
-    @staticmethod
-    def causal_mask(response_mask: Tensor) -> Tensor:
-        length = response_mask.size(1)
-        causal = torch.ones(length, length, device=response_mask.device, dtype=torch.bool).tril()
-        return causal.view(1, 1, length, length) & response_mask[:, None, None, :].bool()
+    def forward(self, features: Tensor, frame_mask: Tensor) -> tuple[Tensor, Tensor]:
+        hidden_states = self.network(features.unsqueeze(1))
+        batch, channels, frames, frequency = hidden_states.shape
+        hidden_states = hidden_states.transpose(1, 2).contiguous().view(
+            batch, frames, channels * frequency
+        )
+        hidden_states = self.projection(hidden_states)
+        mask = F.interpolate(
+            frame_mask.float().unsqueeze(1), size=frames, mode="nearest"
+        ).squeeze(1).bool()
+        return hidden_states, mask
 
-    def forward(
-        self,
-        hidden_states: Tensor,
-        memory: Tensor,
-        response_mask: Tensor,
-        memory_mask: Tensor | None,
-    ) -> Tensor:
-        self_mask = self.causal_mask(response_mask)
-        for layer in self.layers:
-            if self.training and self.gradient_checkpointing:
-                hidden_states = checkpoint(
-                    lambda states, current=layer: current(states, memory, self_mask, memory_mask),
-                    hidden_states,
-                    use_reentrant=False,
+
+class SpeechEncoder(nn.Module):
+    """Acoustic/linguistic representation encoder."""
+
+    def __init__(self, config: Mapping[str, Any]) -> None:
+        super().__init__()
+        audio = config["audio"]
+        speech = config["speech_encoder"]
+        d_model = int(speech["d_model"])
+        self.frontend = LogMelFrontend(audio)
+        self.subsampling = ConvSubsampling(
+            int(audio["feature_dim"]),
+            d_model,
+            int(speech["subsampling_factor"]),
+        )
+        self.position = PositionalEncoding(d_model)
+        self.encoder = TransformerEncoder(
+            nn.ModuleList(
+                TransformerBlock(
+                    d_model,
+                    int(speech["attention_heads"]),
+                    int(speech["d_ff"]),
+                    float(speech["dropout"]),
                 )
-            else:
-                hidden_states = layer(hidden_states, memory, self_mask, memory_mask)
-        return self.norm(hidden_states)
+                for _ in range(int(speech["layers"]))
+            ),
+            d_model,
+            bool(config["model"].get("gradient_checkpointing", False)),
+        )
+
+    def forward(
+        self,
+        waveform: Tensor,
+        audio_mask: Tensor | None = None,
+    ) -> tuple[Tensor, Tensor]:
+        features, frame_mask = self.frontend(waveform, audio_mask)
+        hidden_states, mask = self.subsampling(features, frame_mask)
+        return self.encoder(self.position(hidden_states), mask), mask
 
 
-class MultiTaskTransformer(nn.Module):
-    def __init__(self, config: dict[str, Any]) -> None:
+class CrossAttention(nn.Module):
+    def __init__(self, d_model: int, heads: int, dropout: float) -> None:
         super().__init__()
-        model = config["model"]
-        d_model = model["d_model"]
-        self.embedding = TokenEmbedding(config["tokenizer"]["vocab_size"], d_model)
-        self.position = PositionalEncoding(d_model, model["max_input_length"], model["dropout"])
-        self.encoder = Encoder(
+        self.norm = LayerNorm(d_model)
+        self.attention = MultiHeadAttention(d_model, heads, dropout)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(
+        self,
+        queries: Tensor,
+        memory: Tensor,
+        memory_mask: Tensor | None,
+    ) -> Tensor:
+        normalised = self.norm(queries)
+        return queries + self.dropout(
+            self.attention(normalised, memory, memory, memory_mask)
+        )
+
+
+class SemanticResampler(nn.Module):
+    """Compress long speech sequences into fixed semantic latent tokens."""
+
+    def __init__(self, config: Mapping[str, Any]) -> None:
+        super().__init__()
+        section = config["semantic_resampler"]
+        d_model = int(section["d_model"])
+        self.latent_tokens = int(section["latent_tokens"])
+        self.queries = nn.Parameter(torch.empty(1, self.latent_tokens, d_model))
+        nn.init.normal_(self.queries, std=d_model ** -0.5)
+        self.cross_attention = CrossAttention(
+            d_model,
+            int(section["attention_heads"]),
+            float(section["dropout"]),
+        )
+        self.norm = LayerNorm(d_model)
+
+    def forward(self, speech_states: Tensor, speech_mask: Tensor) -> tuple[Tensor, Tensor]:
+        queries = self.queries.expand(speech_states.size(0), -1, -1)
+        latents = self.cross_attention(queries, speech_states, speech_mask)
+        latents = self.norm(latents)
+        return latents, torch.ones(
+            latents.size(0), latents.size(1), device=latents.device, dtype=torch.bool
+        )
+
+
+class SemanticCore(nn.Module):
+    """Contextual semantic representation over the resampled speech latents."""
+
+    def __init__(self, config: Mapping[str, Any]) -> None:
+        super().__init__()
+        section = config["semantic_core"]
+        d_model = int(section["d_model"])
+        self.encoder = TransformerEncoder(
             nn.ModuleList(
-                EncoderBlock(d_model, model["attention_heads"], model["d_ff"], model["dropout"])
-                for _ in range(model["encoder_layers"])
+                TransformerBlock(
+                    d_model,
+                    int(section["attention_heads"]),
+                    int(section["d_ff"]),
+                    float(section["dropout"]),
+                )
+                for _ in range(int(section["layers"]))
             ),
             d_model,
-            model["gradient_checkpointing"],
+            bool(config["model"].get("gradient_checkpointing", False)),
         )
-        self.response_position = PositionalEncoding(
-            d_model, model["max_response_length"], model["dropout"]
-        )
-        self.decoder = Decoder(
-            nn.ModuleList(
-                DecoderBlock(d_model, model["attention_heads"], model["d_ff"], model["dropout"])
-                for _ in range(model["decoder_layers"])
-            ),
+
+    def forward(self, semantic_latents: Tensor, semantic_mask: Tensor) -> Tensor:
+        return self.encoder(semantic_latents, semantic_mask)
+
+
+class OperationDecoder(nn.Module):
+    """Decode a bounded sequence of operation queries from semantic memory."""
+
+    def __init__(self, config: Mapping[str, Any]) -> None:
+        super().__init__()
+        section = config["operation_decoder"]
+        d_model = int(section["d_model"])
+        self.max_operations = int(section["max_operations"])
+        self.queries = nn.Parameter(torch.empty(1, self.max_operations, d_model))
+        nn.init.normal_(self.queries, std=d_model ** -0.5)
+        self.cross_attention = CrossAttention(
             d_model,
-            model["gradient_checkpointing"],
+            int(section["attention_heads"]),
+            float(section["dropout"]),
         )
-        self.response_head = nn.Linear(d_model, config["tokenizer"]["vocab_size"], bias=False)
-        if model.get("tie_response_embeddings", True):
-            self.response_head.weight = self.embedding.embedding.weight
-        self.act_head = nn.Linear(d_model, len(config["labels"]["acts"]))
-        self.goal_head = nn.Linear(d_model, len(config["labels"]["goals"]))
-        self.categorical_heads = nn.ModuleDict({key: nn.Linear(d_model, len(labels)) for key, labels in config["heads"]["categorical"].items()})
-        self.span_start_heads = nn.ModuleDict({key: nn.Linear(d_model, 1) for key in config["heads"]["spans"]})
-        self.span_end_heads = nn.ModuleDict({key: nn.Linear(d_model, 1) for key in config["heads"]["spans"]})
+        self.norm = LayerNorm(d_model)
+        self.presence_head = nn.Linear(d_model, 1)
+
+    def forward(self, semantic_states: Tensor, semantic_mask: Tensor) -> tuple[Tensor, Tensor]:
+        queries = self.queries.expand(semantic_states.size(0), -1, -1)
+        queries = self.norm(self.cross_attention(queries, semantic_states, semantic_mask))
+        return queries, self.presence_head(queries).squeeze(-1)
+
+
+class CapabilitySchemaRetriever(nn.Module):
+    """Resolve goals by similarity to capability schema embeddings.
+
+    This is intentionally not an ``N_goals`` classifier head.  A caller may
+    provide externally encoded schema vectors at inference time; the learned
+    vectors are only the local fallback when no registry encoder is available.
+    """
+
+    def __init__(self, config: Mapping[str, Any]) -> None:
+        super().__init__()
+        section = config["semantic_core"]
+        d_model = int(section["d_model"])
+        goals = list(config["ontology"]["schema_order"])
+        self.goals = goals
+        self.temperature = nn.Parameter(torch.tensor(0.07))
+        self.schema_embeddings = nn.Parameter(torch.empty(len(goals), d_model))
+        nn.init.normal_(self.schema_embeddings, std=d_model ** -0.5)
+
+    def forward(
+        self,
+        operation_queries: Tensor,
+        capability_embeddings: Tensor | None = None,
+    ) -> Tensor:
+        schemas = self.schema_embeddings if capability_embeddings is None else capability_embeddings
+        if schemas.dim() != 2 or schemas.size(0) != len(self.goals) or schemas.size(1) != operation_queries.size(-1):
+            raise ValueError("capability_embeddings must have shape [capabilities, d_model]")
+        queries = F.normalize(operation_queries, dim=-1)
+        schemas = F.normalize(schemas.to(operation_queries), dim=-1)
+        temperature = self.temperature.abs().clamp_min(1e-3)
+        return queries @ schemas.transpose(0, 1) / temperature
+
+
+class ParameterHead(nn.Module):
+    """Typed parameter extractor head for one schema parameter."""
+
+    SOURCES = ["ABSENT", "INPUT_SPAN", "STATE_REFERENCE"]
+
+    def __init__(self, parameter: Mapping[str, Any], d_model: int) -> None:
+        super().__init__()
+        self.parameter_type = str(parameter["type"])
+        self.values = list(parameter.get("values", []))
+        self.reference_paths = list(parameter.get("state_reference_paths", []))
+        self.value_projection = nn.Linear(d_model, d_model)
+        self.presence_head = nn.Linear(d_model, 2)
+        if self.parameter_type == "ENUM":
+            self.enum_head = nn.Linear(d_model, len(self.values))
+        elif self.parameter_type == "NUMBER":
+            self.number_head = nn.Linear(d_model, 1)
+        elif self.parameter_type in {"ENTITY", "FREE_TEXT", "STATE_REFERENCE"}:
+            self.source_head = nn.Linear(d_model, len(self.SOURCES))
+            self.span_query = nn.Linear(d_model, d_model)
+            self.token_projection = nn.Linear(d_model, d_model)
+            if self.parameter_type == "STATE_REFERENCE":
+                self.reference_head = nn.Linear(d_model, len(self.reference_paths))
+        elif self.parameter_type == "BOOLEAN":
+            self.boolean_head = nn.Linear(d_model, 2)
+        else:
+            raise ValueError(f"unsupported parameter type: {self.parameter_type}")
+
+    def forward(self, operation_queries: Tensor, semantic_states: Tensor) -> dict[str, Tensor]:
+        value_states = self.value_projection(operation_queries)
+        result: dict[str, Tensor] = {
+            "presence_logits": self.presence_head(value_states),
+        }
+        if self.parameter_type == "ENUM":
+            result["enum_logits"] = self.enum_head(value_states)
+        elif self.parameter_type == "NUMBER":
+            result["number_value"] = self.number_head(value_states).squeeze(-1)
+        elif self.parameter_type in {"ENTITY", "FREE_TEXT", "STATE_REFERENCE"}:
+            result["source_logits"] = self.source_head(value_states)
+            if self.parameter_type in {"ENTITY", "FREE_TEXT"}:
+                query = self.span_query(value_states)
+                tokens = self.token_projection(semantic_states)
+                result["span_start_logits"] = torch.einsum("bnd,bsd->bns", query, tokens)
+                result["span_end_logits"] = torch.einsum("bnd,bsd->bns", query, tokens)
+                result["entity_query"] = F.normalize(query, dim=-1)
+            if self.parameter_type == "STATE_REFERENCE":
+                result["reference_logits"] = self.reference_head(value_states)
+        elif self.parameter_type == "BOOLEAN":
+            result["boolean_logits"] = self.boolean_head(value_states)
+        return result
+
+
+class TypedParameterExtractor(nn.Module):
+    """Apply schema-specific typed heads to every decoded operation query."""
+
+    def __init__(self, config: Mapping[str, Any]) -> None:
+        super().__init__()
+        d_model = int(config["semantic_core"]["d_model"])
+        self.heads = nn.ModuleDict()
+        self.metadata: dict[str, dict[str, Any]] = {}
+        for goal in config["ontology"]["schema_order"]:
+            for name, parameter in config["ontology"]["capabilities"][goal]["parameters"].items():
+                key = f"{goal}__{name}"
+                self.heads[key] = ParameterHead(parameter, d_model)
+                self.metadata[key] = dict(parameter)
+
+    def forward(self, operation_queries: Tensor, semantic_states: Tensor) -> dict[str, dict[str, dict[str, Tensor]]]:
+        result: dict[str, dict[str, dict[str, Tensor]]] = {}
+        for key, head in self.heads.items():
+            goal, name = key.split("__", 1)
+            result.setdefault(goal, {})[name] = head(operation_queries, semantic_states)
+        return result
+
+
+class VoiceNativeSLU(nn.Module):
+    """VALLS SLU V0: audio -> semantic execution frame ingredients."""
+
+    def __init__(self, config: Mapping[str, Any]) -> None:
+        super().__init__()
+        validate_config(config)
+        self.config = dict(config)
+        d_model = int(config["semantic_core"]["d_model"])
+        self.speech_encoder = SpeechEncoder(config)
+        self.semantic_resampler = SemanticResampler(config)
+        self.semantic_core = SemanticCore(config)
+        self.operation_decoder = OperationDecoder(config)
+        self.schema_retriever = CapabilitySchemaRetriever(config)
+        self.parameter_extractor = TypedParameterExtractor(config)
+        self.act_head = nn.Linear(d_model, len(config["ontology"]["acts"]))
+        self.confidence_head = nn.Linear(d_model, 3)
+        self.ood_head = nn.Linear(d_model, 1)
+        lexical = config["lexical_branch"]
+        self.lexical_head = nn.Linear(d_model, int(lexical["vocab_size"])) if lexical.get("enabled", True) else None
         self.apply(self._reset_parameters)
-        nn.init.normal_(self.embedding.embedding.weight, mean=0.0, std=d_model ** -0.5)
 
     @staticmethod
     def _reset_parameters(module: nn.Module) -> None:
@@ -303,45 +565,68 @@ class MultiTaskTransformer(nn.Module):
             if module.bias is not None:
                 nn.init.zeros_(module.bias)
 
-    def encode(self, input_ids: Tensor, input_mask: Tensor | None = None) -> Tensor:
-        return self.encoder(self.position(self.embedding(input_ids)), input_mask)
+    @staticmethod
+    def _masked_mean(hidden_states: Tensor, mask: Tensor) -> Tensor:
+        weights = mask.to(hidden_states.dtype).unsqueeze(-1)
+        return (hidden_states * weights).sum(1) / weights.sum(1).clamp_min(1.0)
 
-    def decode(
+    def encode_audio(
         self,
-        decoder_input_ids: Tensor,
-        memory: Tensor,
-        response_mask: Tensor,
-        input_mask: Tensor | None,
-    ) -> Tensor:
-        hidden = self.response_position(self.embedding(decoder_input_ids))
-        return self.decoder(hidden, memory, response_mask, input_mask)
+        waveform: Tensor,
+        audio_mask: Tensor | None = None,
+    ) -> dict[str, Tensor]:
+        speech_states, speech_mask = self.speech_encoder(waveform, audio_mask)
+        semantic_latents, semantic_mask = self.semantic_resampler(speech_states, speech_mask)
+        semantic_states = self.semantic_core(semantic_latents, semantic_mask)
+        return {
+            "speech_states": speech_states,
+            "speech_mask": speech_mask,
+            "semantic_latents": semantic_latents,
+            "semantic_mask": semantic_mask,
+            "semantic_states": semantic_states,
+        }
 
     def forward(
         self,
-        input_ids: Tensor,
-        input_mask: Tensor | None = None,
-        decoder_input_ids: Tensor | None = None,
-        response_mask: Tensor | None = None,
+        waveform: Tensor,
+        audio_mask: Tensor | None = None,
+        capability_embeddings: Tensor | None = None,
     ) -> dict[str, Any]:
-        hidden = self.encode(input_ids, input_mask)
-        pooled = hidden[:, 0]
-        outputs = {
+        encoded = self.encode_audio(waveform, audio_mask)
+        semantic_states = encoded["semantic_states"]
+        semantic_mask = encoded["semantic_mask"]
+        pooled = self._masked_mean(semantic_states, semantic_mask)
+        operation_queries, operation_presence_logits = self.operation_decoder(
+            semantic_states, semantic_mask
+        )
+        outputs: dict[str, Any] = {
+            **encoded,
+            "pooled_semantic": pooled,
             "act_logits": self.act_head(pooled),
-            "goal_logits": self.goal_head(pooled),
-            "categorical_logits": {key: head(pooled) for key, head in self.categorical_heads.items()},
-            "span_start_logits": {key: head(hidden).squeeze(-1) for key, head in self.span_start_heads.items()},
-            "span_end_logits": {key: head(hidden).squeeze(-1) for key, head in self.span_end_heads.items()},
+            "confidence_logits": self.confidence_head(pooled),
+            "ood_logit": self.ood_head(pooled).squeeze(-1),
+            "operation_queries": operation_queries,
+            "operation_presence_logits": operation_presence_logits,
+            "goal_scores": self.schema_retriever(operation_queries, capability_embeddings),
+            "parameter_outputs": self.parameter_extractor(operation_queries, semantic_states),
         }
-        if decoder_input_ids is not None:
-            if response_mask is None:
-                response_mask = torch.ones_like(decoder_input_ids, dtype=torch.bool)
-            decoded = self.decode(decoder_input_ids, hidden, response_mask, input_mask)
-            outputs["response_logits"] = self.response_head(decoded)
+        if self.lexical_head is not None:
+            outputs["lexical_ctc_logits"] = self.lexical_head(encoded["speech_states"])
         return outputs
 
 
-def build_model(config: dict[str, Any]) -> MultiTaskTransformer:
-    from .config import validate_config
+# Descriptive aliases make the architecture names available to callers without
+# duplicating implementation classes.
+SpeechSemanticAdapter = SemanticResampler
+GoalQueryGenerator = OperationDecoder
+
+
+def build_model(config: Mapping[str, Any]) -> VoiceNativeSLU:
+    """Validate configuration and construct the VALLS SLU V0 model."""
 
     validate_config(config)
-    return MultiTaskTransformer(config)
+    return VoiceNativeSLU(config)
+
+
+# Backward-compatible name is intentionally an alias, not the old text model.
+MultiTaskTransformer = VoiceNativeSLU
