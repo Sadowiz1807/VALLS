@@ -8,7 +8,9 @@ Harness result.
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
+import random
 from enum import Enum
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
@@ -22,7 +24,7 @@ from tqdm.auto import tqdm
 
 from .config import validate_config
 from .dataset import DatasetContractError, validate_target
-from .model import VoiceNativeSLU, build_model
+from .model import SpanExtractor, VoiceNativeSLU, build_model
 
 IGNORE_INDEX = -100
 
@@ -131,11 +133,12 @@ def _parameter_loss(
     }
     hard_negative_limit = int(config["training"]["loss_weights"].get("parameter_hard_negative_schemas", 4))
     selected_schema_names = sorted(target_goals)
-    for schema in schemas:
-        if schema["name"] not in target_goals and len(selected_schema_names) >= len(target_goals) + hard_negative_limit:
-            continue
-        if schema["name"] not in target_goals:
-            selected_schema_names.append(str(schema["name"]))
+    negative_schemas = [str(schema["name"]) for schema in schemas if str(schema["name"]) not in target_goals]
+    sample_key = "|".join(str(sample_id) for sample_id in batch.get("sample_id", []))
+    seed_bytes = hashlib.sha256(sample_key.encode("utf-8")).digest()
+    rng = random.Random(int(config["training"].get("seed", 42)) + int.from_bytes(seed_bytes[:8], "little"))
+    rng.shuffle(negative_schemas)
+    selected_schema_names.extend(negative_schemas[:hard_negative_limit])
     selected_schema_names = set(selected_schema_names)
     for schema in schemas:
         if str(schema["name"]) not in selected_schema_names:
@@ -194,16 +197,44 @@ def _parameter_loss(
                 elif parameter_type in {"ENTITY", "FREE_TEXT"}:
                     start_ratios: list[float] = []
                     end_ratios: list[float] = []
+                    source_labels: list[int] = []
+                    reference_values: list[str] = []
+                    input_values: list[dict[str, Any]] = []
                     for value in active_values:
-                        if not isinstance(value, dict) or value.get("source") != "input_span":
-                            raise DatasetContractError(f"{goal}.{name} requires an input_span target")
+                        if not isinstance(value, dict):
+                            raise DatasetContractError(f"{goal}.{name} requires a typed target")
+                        source = value.get("source")
+                        if source == "state_reference":
+                            source_labels.append(SpanExtractor.SOURCES.index("STATE_REFERENCE"))
+                            reference_values.append(str(value.get("path")))
+                            continue
+                        if source != "input_span":
+                            raise DatasetContractError(f"{goal}.{name} has unsupported source: {source!r}")
+                        source_labels.append(SpanExtractor.SOURCES.index("INPUT_SPAN"))
+                        input_values.append(value)
+                    source_tensor = torch.tensor(source_labels, dtype=torch.long, device=device)
+                    parameter_losses.append(F.cross_entropy(head["source_logits"][rows, operation_index], source_tensor))
+                    input_rows = [row for row, value in zip(active_rows, active_values) if value.get("source") == "input_span"]
+                    input_rows_tensor = torch.tensor(input_rows, dtype=torch.long, device=device)
+                    for value in input_values:
                         alignment = value.get("alignment")
                         if not isinstance(alignment, Mapping):
                             raise DatasetContractError(f"{goal}.{name} requires frame alignment")
                         start_ratios.append(float(alignment["start"]))
                         end_ratios.append(float(alignment["end"]))
-                    start_logits = head["span_start_logits"][rows, operation_index]
-                    end_logits = head["span_end_logits"][rows, operation_index]
+                    if reference_values:
+                        reference_paths = parameter.get("state_reference_paths", [])
+                        reference_rows = torch.tensor(
+                            [row for row, value in zip(active_rows, active_values) if value.get("source") == "state_reference"],
+                            dtype=torch.long,
+                            device=device,
+                        )
+                        reference_labels = torch.tensor([reference_paths.index(path) for path in reference_values], dtype=torch.long, device=device)
+                        parameter_losses.append(F.cross_entropy(head["reference_logits"][reference_rows, operation_index], reference_labels))
+                    if not input_values:
+                        continue
+                    start_logits = head["span_start_logits"][input_rows_tensor, operation_index]
+                    end_logits = head["span_end_logits"][input_rows_tensor, operation_index]
                     frame_count = start_logits.size(-1)
                     start_labels = torch.tensor(start_ratios, device=device).mul(frame_count - 1).round().long().clamp(0, frame_count - 1)
                     end_labels = torch.tensor(end_ratios, device=device).mul(frame_count - 1).round().long().clamp(0, frame_count - 1)
@@ -234,10 +265,11 @@ def compute_loss(
     """Compute staged V0 semantic losses."""
 
     enabled = set(config["training"]["loss_weights"]) if enabled_losses is None else set(enabled_losses)
-    device = outputs["act_logits"].device
-    schemas = _runtime_schemas(outputs)
+    anchor = outputs.get("act_logits", outputs["bridge_states"])
+    device = anchor.device
+    schemas = _runtime_schemas(outputs) if "capability_schemas" in outputs else []
     losses: dict[str, Tensor] = {}
-    zero = outputs["act_logits"].sum() * 0.0
+    zero = anchor.sum() * 0.0
 
     if "act" in enabled:
         losses["act"] = F.cross_entropy(outputs["act_logits"], _target_act_ids(batch, config, device))
@@ -275,6 +307,8 @@ def compute_loss(
     if "ood" in enabled:
         losses["ood"] = F.binary_cross_entropy_with_logits(outputs["ood_logit"], _target_ood(batch, device))
     if "bridge_alignment" in enabled:
+        if "bridge_states" not in outputs:
+            raise DatasetContractError("bridge_alignment requires bridge_only model outputs")
         speech = F.normalize(outputs["speech_states"], dim=-1)
         speech_mask = outputs["speech_mask"].to(speech.dtype).unsqueeze(-1)
         speech_summary = (speech * speech_mask).sum(1) / speech_mask.sum(1).clamp_min(1.0)
@@ -317,15 +351,31 @@ def compute_loss(
     return total, losses
 
 
+def get_trainable_parameter_names(model: VoiceNativeSLU) -> list[str]:
+    """Return a deterministic audit view of the current stage freeze policy."""
+
+    return [name for name, parameter in model.named_parameters() if parameter.requires_grad]
+
+
 def configure_stage(model: VoiceNativeSLU, stage: TrainingStage | str) -> None:
-    """Freeze all modules not owned by a curriculum stage."""
+    """Freeze by explicit module ownership, safely handling shared modules."""
 
     selected = TrainingStage(stage)
-    trainable = _STAGE_MODULES[selected]
-    for name, module in model.named_children():
-        enabled = name in trainable
+    trainable_modules = _STAGE_MODULES[selected]
+    for parameter in model.parameters():
+        parameter.requires_grad = False
+
+    seen: set[int] = set()
+    for module_name in trainable_modules:
+        module = getattr(model, module_name, None)
+        if module is None:
+            continue
         for parameter in module.parameters():
-            parameter.requires_grad = enabled
+            parameter_id = id(parameter)
+            if parameter_id in seen:
+                continue
+            parameter.requires_grad = True
+            seen.add(parameter_id)
 
 
 def build_stage_optimizer(
@@ -367,9 +417,10 @@ def train_epoch(
 ) -> float:
     """Train one epoch with the selected curriculum-stage loss set."""
 
+    selected = TrainingStage(stage)
+    configure_stage(model, selected)
     model.train()
     _set_stage_modes(model)
-    selected = TrainingStage(stage)
     enabled = set(config["training"]["stages"][selected.value]["enabled_losses"])
     accumulation = int(config["training"]["gradient_accumulation_steps"])
     clip_norm = float(config["training"]["gradient_clip_norm"])
@@ -396,7 +447,7 @@ def train_epoch(
     for raw_batch in progress:
         batch = _move_batch(raw_batch, device)
         with torch.amp.autocast(device_type=device.type, enabled=use_amp):
-            outputs = model(batch["waveform"], batch.get("audio_mask"))
+            outputs = model(batch["waveform"], batch.get("audio_mask"), bridge_only=selected == TrainingStage.BRIDGE)
             stage_config = dict(config)
             stage_config["training"] = dict(config["training"])
             stage_config["training"]["lexical_source"] = config["training"]["stages"][selected.value].get("lexical_source", "speech")
@@ -439,14 +490,25 @@ def _parameter_exact_match(
                 elif parameter_type == "STATE_REFERENCE":
                     reference_id = int(head["reference_logits"][row_index, operation_index].argmax())
                     is_correct = parameter["state_reference_paths"][reference_id] == value["path"]
+                elif parameter_type in {"ENTITY", "FREE_TEXT"}:
+                    source = value.get("source") if isinstance(value, Mapping) else None
+                    source_id = int(head["source_logits"][row_index, operation_index].argmax())
+                    if source == "state_reference":
+                        is_correct = (
+                            source_id == SpanExtractor.SOURCES.index("STATE_REFERENCE")
+                            and "reference_logits" in head
+                            and parameter["state_reference_paths"][int(head["reference_logits"][row_index, operation_index].argmax())] == value["path"]
+                        )
+                    else:
+                        start = int(head["span_start_logits"][row_index, operation_index].argmax())
+                        end = int(head["span_end_logits"][row_index, operation_index].argmax())
+                        alignment = value.get("alignment", {}) if isinstance(value, Mapping) else {}
+                        frame_count = head["span_start_logits"].size(-1)
+                        expected_start = round(float(alignment.get("start", -1)) * (frame_count - 1))
+                        expected_end = round(float(alignment.get("end", -1)) * (frame_count - 1))
+                        is_correct = source_id == SpanExtractor.SOURCES.index("INPUT_SPAN") and abs(start - expected_start) <= 1 and abs(end - expected_end) <= 1
                 else:
-                    start = int(head["span_start_logits"][row_index, operation_index].argmax())
-                    end = int(head["span_end_logits"][row_index, operation_index].argmax())
-                    alignment = value.get("alignment", {}) if isinstance(value, Mapping) else {}
-                    frame_count = head["span_start_logits"].size(-1)
-                    expected_start = round(float(alignment.get("start", -1)) * (frame_count - 1))
-                    expected_end = round(float(alignment.get("end", -1)) * (frame_count - 1))
-                    is_correct = abs(start - expected_start) <= 1 and abs(end - expected_end) <= 1
+                    is_correct = False
                 total += 1
                 correct += int(is_correct)
     return correct, total
@@ -466,8 +528,12 @@ def validate_model(
     goal_total = goal_correct = action_total = action_correct = frame_exact = 0
     parameter_correct = parameter_total = 0
     total_loss = 0.0
+    ctc_invalid_count = 0
+    ctc_sample_count = 0
     with torch.no_grad():
         for raw_batch in batches:
+            ctc_invalid_count += int(raw_batch.get("ctc_invalid_count", 0))
+            ctc_sample_count += int(raw_batch.get("ctc_sample_count", len(raw_batch.get("target", []))))
             batch = _move_batch(raw_batch, device)
             outputs = model(batch["waveform"], batch.get("audio_mask"), capability_schemas=capability_schemas)
             loss, _ = compute_loss(outputs, batch, config, set(config["training"]["loss_weights"]))
@@ -488,8 +554,11 @@ def validate_model(
             # full frame validation is performed by assemble_frame below.
             for row, target in enumerate(batch["target"]):
                 all_correct = predictions[row].item() == labels[row].item()
+                gold_count = len(target.get("operations", []))
+                predicted_count = int(predicted_presence[row].sum().item())
+                all_correct = all_correct and predicted_count == gold_count
                 if not target.get("operations"):
-                    frame_exact += int(all_correct and not bool(predicted_presence[row].any().item()))
+                    frame_exact += int(all_correct)
                     continue
                 for operation_index, operation in enumerate(target["operations"]):
                     schema_index = _schema_index(schemas, operation["goal"])
@@ -507,7 +576,7 @@ def validate_model(
     if not samples:
         raise ValueError("no validation batches")
     return {
-        "ctc_invalid_ratio": 0.0,
+        "ctc_invalid_ratio": ctc_invalid_count / max(ctc_sample_count, 1),
         "validation_loss": total_loss / samples,
         "act_accuracy": act_correct / samples,
         "goal_retrieval_accuracy": goal_correct / max(goal_total, 1),
@@ -592,7 +661,16 @@ def predict(
             elif parameter_type == "STATE_REFERENCE":
                 reference_id = int(head["reference_logits"][0, operation_index].argmax())
                 parameters[name] = {"source": "state_reference", "path": parameter_schema["state_reference_paths"][reference_id]}
-            else:
+            elif parameter_type in {"ENTITY", "FREE_TEXT"}:
+                source_id = int(head["source_logits"][0, operation_index].argmax())
+                if source_id == SpanExtractor.SOURCES.index("STATE_REFERENCE"):
+                    if not parameter_schema.get("state_reference_paths") or "reference_logits" not in head:
+                        return {"act": "ASK_CLARIFICATION", "operations": [], "confidence": {**base_confidence, "goal": goal_confidence, "parameters": parameter_confidence}}
+                    reference_id = int(head["reference_logits"][0, operation_index].argmax())
+                    parameters[name] = {"source": "state_reference", "path": parameter_schema["state_reference_paths"][reference_id]}
+                    continue
+                if source_id != SpanExtractor.SOURCES.index("INPUT_SPAN"):
+                    return {"act": "ASK_CLARIFICATION", "operations": [], "confidence": {**base_confidence, "goal": goal_confidence, "parameters": parameter_confidence}}
                 start = int(head["span_start_logits"][0, operation_index].argmax())
                 end = max(start, int(head["span_end_logits"][0, operation_index].argmax()))
                 frame_count = head["span_start_logits"].size(-1)
