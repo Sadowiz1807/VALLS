@@ -39,8 +39,8 @@ class TrainingStage(str, Enum):
 
 
 _STAGE_MODULES: dict[TrainingStage, set[str]] = {
-    TrainingStage.ACOUSTIC: {"speech_encoder"},
-    TrainingStage.BRIDGE: {"speech_encoder", "semantic_resampler"},
+    TrainingStage.ACOUSTIC: {"speech_encoder", "lexical_head"},
+    TrainingStage.BRIDGE: {"semantic_resampler", "bridge_alignment_head"},
     TrainingStage.SEMANTIC: {"semantic_resampler", "semantic_core", "operation_decoder", "schema_encoder", "schema_retriever", "action_resolver", "act_head"},
     TrainingStage.PARAMETER: {"semantic_resampler", "semantic_core", "operation_decoder", "schema_encoder", "schema_retriever", "action_resolver", "parameter_extractor"},
     TrainingStage.SAFETY: {"semantic_core", "confidence_head", "ood_head"},
@@ -124,7 +124,22 @@ def _parameter_loss(
     device = outputs["operation_queries"].device
     max_operations = int(config["operation_decoder"]["max_operations"])
     parameter_losses: list[Tensor] = []
+    target_goals = {
+        str(operation.get("goal"))
+        for target in batch["target"]
+        for operation in target.get("operations", [])
+    }
+    hard_negative_limit = int(config["training"]["loss_weights"].get("parameter_hard_negative_schemas", 4))
+    selected_schema_names = sorted(target_goals)
     for schema in schemas:
+        if schema["name"] not in target_goals and len(selected_schema_names) >= len(target_goals) + hard_negative_limit:
+            continue
+        if schema["name"] not in target_goals:
+            selected_schema_names.append(str(schema["name"]))
+    selected_schema_names = set(selected_schema_names)
+    for schema in schemas:
+        if str(schema["name"]) not in selected_schema_names:
+            continue
         goal = str(schema["name"])
         outputs_for_goal = outputs["parameter_outputs"].get(goal, {})
         for name, parameter in schema.get("parameters", {}).items():
@@ -144,10 +159,12 @@ def _parameter_loss(
                     if value is not None:
                         active_rows.append(row)
                         active_values.append(value)
+                negative_weight = float(config["training"]["loss_weights"].get("parameter_presence_negative_weight", 0.25))
                 parameter_losses.append(
                     F.cross_entropy(
                         head["presence_logits"][:, operation_index],
                         torch.tensor(presence_labels, dtype=torch.long, device=device),
+                        weight=torch.tensor([negative_weight, 1.0], dtype=torch.float32, device=device),
                     )
                 )
                 if not active_rows:
@@ -194,6 +211,20 @@ def _parameter_loss(
     return parameter_losses
 
 
+def _ctc_required_lengths(labels: Tensor, target_lengths: Tensor) -> Tensor:
+    """Account for repeated adjacent labels that need an intervening blank."""
+
+    required: list[int] = []
+    offset = 0
+    for length in target_lengths.tolist():
+        length = int(length)
+        target = labels[offset : offset + length]
+        repeats = int((target[1:] == target[:-1]).sum()) if length > 1 else 0
+        required.append(length + repeats)
+        offset += length
+    return torch.tensor(required, dtype=torch.long, device=target_lengths.device)
+
+
 def compute_loss(
     outputs: Mapping[str, Any],
     batch: Mapping[str, Any],
@@ -202,7 +233,7 @@ def compute_loss(
 ) -> tuple[Tensor, dict[str, Tensor]]:
     """Compute staged V0 semantic losses."""
 
-    enabled = enabled_losses or set(config["training"]["loss_weights"])
+    enabled = set(config["training"]["loss_weights"]) if enabled_losses is None else set(enabled_losses)
     device = outputs["act_logits"].device
     schemas = _runtime_schemas(outputs)
     losses: dict[str, Tensor] = {}
@@ -243,19 +274,40 @@ def compute_loss(
         losses["confidence"] = (error * mask).sum() / mask.sum().clamp_min(1.0)
     if "ood" in enabled:
         losses["ood"] = F.binary_cross_entropy_with_logits(outputs["ood_logit"], _target_ood(batch, device))
+    if "bridge_alignment" in enabled:
+        speech = F.normalize(outputs["speech_states"], dim=-1)
+        speech_mask = outputs["speech_mask"].to(speech.dtype).unsqueeze(-1)
+        speech_summary = (speech * speech_mask).sum(1) / speech_mask.sum(1).clamp_min(1.0)
+        bridge = F.normalize(outputs["bridge_states"], dim=-1)
+        speech_summary = speech_summary.unsqueeze(1).expand_as(bridge)
+        losses["bridge_alignment"] = 1.0 - (bridge * speech_summary).sum(-1).mean()
     if "lexical" in enabled:
+        if int(batch.get("ctc_invalid_count", 0)) > 0:
+            raise DatasetContractError(
+                f"ctc_invalid_ratio={int(batch['ctc_invalid_count']) / max(int(batch.get('ctc_sample_count', 1)), 1):.6f}"
+            )
         if "lexical_ctc_logits" not in outputs or "lexical_labels" not in batch:
             losses["lexical"] = zero
         else:
-            log_probs = outputs["lexical_ctc_logits"].log_softmax(-1).transpose(0, 1)
-            input_lengths = outputs["speech_mask"].sum(1).long()
+            lexical_key = "bridge_lexical_logits" if config["training"].get("lexical_source") == "bridge" else "lexical_ctc_logits"
+            log_probs = outputs[lexical_key].log_softmax(-1).transpose(0, 1)
+            input_lengths = outputs["semantic_mask"].sum(1).long() if lexical_key == "bridge_lexical_logits" else outputs["speech_mask"].sum(1).long()
+            lexical_labels = batch["lexical_labels"].to(device)
+            target_lengths = batch["lexical_target_lengths"].to(device)
+            required_lengths = _ctc_required_lengths(lexical_labels, target_lengths)
+            invalid = required_lengths > input_lengths
+            if invalid.any():
+                invalid_ratio = float(invalid.float().mean())
+                raise DatasetContractError(
+                    f"ctc_invalid_ratio={invalid_ratio:.6f}; target requires more timesteps than the selected lexical branch"
+                )
             losses["lexical"] = F.ctc_loss(
                 log_probs,
-                batch["lexical_labels"].to(device),
+                lexical_labels,
                 input_lengths.to(device),
-                batch["lexical_target_lengths"].to(device),
+                target_lengths,
                 blank=int(config["lexical_branch"]["blank_id"]),
-                zero_infinity=True,
+                zero_infinity=False,
             )
 
     if not losses:
@@ -293,6 +345,16 @@ def build_stage_optimizer(
     )
 
 
+def _set_stage_modes(model: VoiceNativeSLU) -> None:
+    """Keep frozen modules deterministic while trainable modules stay in train mode."""
+
+    for module in model.children():
+        if any(parameter.requires_grad for parameter in module.parameters()):
+            module.train()
+        else:
+            module.eval()
+
+
 def train_epoch(
     model: VoiceNativeSLU,
     batches: Iterable[Mapping[str, Any]],
@@ -306,6 +368,7 @@ def train_epoch(
     """Train one epoch with the selected curriculum-stage loss set."""
 
     model.train()
+    _set_stage_modes(model)
     selected = TrainingStage(stage)
     enabled = set(config["training"]["stages"][selected.value]["enabled_losses"])
     accumulation = int(config["training"]["gradient_accumulation_steps"])
@@ -334,7 +397,10 @@ def train_epoch(
         batch = _move_batch(raw_batch, device)
         with torch.amp.autocast(device_type=device.type, enabled=use_amp):
             outputs = model(batch["waveform"], batch.get("audio_mask"))
-            loss, _ = compute_loss(outputs, batch, config, enabled)
+            stage_config = dict(config)
+            stage_config["training"] = dict(config["training"])
+            stage_config["training"]["lexical_source"] = config["training"]["stages"][selected.value].get("lexical_source", "speech")
+            loss, _ = compute_loss(outputs, batch, stage_config, enabled)
         scaler.scale(loss / accumulation).backward()
         total += float(loss.detach())
         count += 1
@@ -421,9 +487,10 @@ def validate_model(
             # operation ordering; no fixed ontology index is assumed.
             # full frame validation is performed by assemble_frame below.
             for row, target in enumerate(batch["target"]):
+                all_correct = predictions[row].item() == labels[row].item()
                 if not target.get("operations"):
+                    frame_exact += int(all_correct and not bool(predicted_presence[row].any().item()))
                     continue
-                all_correct = True
                 for operation_index, operation in enumerate(target["operations"]):
                     schema_index = _schema_index(schemas, operation["goal"])
                     predicted_goal = schemas[int(outputs["goal_scores"][row, operation_index].argmax())]["name"]
@@ -440,6 +507,7 @@ def validate_model(
     if not samples:
         raise ValueError("no validation batches")
     return {
+        "ctc_invalid_ratio": 0.0,
         "validation_loss": total_loss / samples,
         "act_accuracy": act_correct / samples,
         "goal_retrieval_accuracy": goal_correct / max(goal_total, 1),
@@ -482,6 +550,7 @@ def predict(
 
     schemas = outputs["capability_schemas"]
     schema_names = outputs["schema_names"]
+    lexical_resolver = model.lexical_span_resolver
     presence = outputs["operation_presence_logits"].sigmoid()[0]
     confidence_values = outputs["confidence_logits"].sigmoid()[0]
     operations: list[dict[str, Any]] = []
@@ -525,14 +594,21 @@ def predict(
                 parameters[name] = {"source": "state_reference", "path": parameter_schema["state_reference_paths"][reference_id]}
             else:
                 start = int(head["span_start_logits"][0, operation_index].argmax())
-                end = int(head["span_end_logits"][0, operation_index].argmax())
+                end = max(start, int(head["span_end_logits"][0, operation_index].argmax()))
                 frame_count = head["span_start_logits"].size(-1)
+                lexical_logits = outputs.get("lexical_ctc_logits")
+                if lexical_logits is None:
+                    return {"act": "ASK_CLARIFICATION", "operations": [], "confidence": {**base_confidence, "goal": goal_confidence, "parameters": parameter_confidence}}
+                lexical_value = lexical_resolver.resolve(lexical_logits[0], start, end)
+                if not lexical_value:
+                    return {"act": "ASK_CLARIFICATION", "operations": [], "confidence": {**base_confidence, "goal": goal_confidence, "parameters": parameter_confidence}}
                 parameters[name] = {
                     "source": "input_span",
+                    "value": lexical_value,
                     "start_frame": start,
-                    "end_frame": max(start, end),
+                    "end_frame": end,
                     "start_ratio": start / max(frame_count - 1, 1),
-                    "end_ratio": (max(start, end) + 1) / max(frame_count, 1),
+                    "end_ratio": (end + 1) / max(frame_count, 1),
                 }
         operations.append({"order": operation_index + 1, "goal": goal, "action": action, "parameters": parameters, "confidence": min(goal_confidence, action_confidence)})
 
@@ -558,6 +634,7 @@ def assemble_frame(
     *,
     request_id: str | None = None,
     model_version: str | None = None,
+    capability_schemas: Sequence[Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Validate and serialize the V0 Semantic Execution Frame."""
 
@@ -569,7 +646,11 @@ def assemble_frame(
     for key, value in confidence.items():
         if not isinstance(value, (int, float)) or not 0 <= float(value) <= 1:
             raise DatasetContractError(f"confidence.{key} must be in [0,1]")
-    validate_target({"act": frame.get("act"), "operations": frame.get("operations", [])}, config)
+    validate_target(
+        {"act": frame.get("act"), "operations": frame.get("operations", [])},
+        config,
+        capability_schemas=capability_schemas,
+    )
     if float(confidence.get("ood", 1.0)) > float(config["inference"]["max_ood_score"]):
         raise DatasetContractError("prediction is out of distribution")
     if float(confidence.get("overall", 0.0)) < float(config["inference"]["act_min_confidence"]):

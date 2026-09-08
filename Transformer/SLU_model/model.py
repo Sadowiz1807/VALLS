@@ -203,14 +203,25 @@ class ConformerBlock(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, hidden_states: Tensor, mask: Tensor | None) -> Tensor:
-        hidden_states = hidden_states + 0.5 * self.dropout(self.ffn1(self.ffn1_norm(hidden_states)))
-        normalised = self.attention_norm(hidden_states)
-        hidden_states = hidden_states + self.attention_dropout(
-            self.attention(normalised, normalised, normalised, mask)
+        def apply_mask(values: Tensor) -> Tensor:
+            if mask is not None:
+                return values * mask.unsqueeze(-1).to(values.dtype)
+            return values
+
+        hidden_states = apply_mask(
+            hidden_states + 0.5 * self.dropout(self.ffn1(self.ffn1_norm(hidden_states)))
         )
-        hidden_states = hidden_states + self.conv(hidden_states, mask)
-        hidden_states = hidden_states + 0.5 * self.dropout(self.ffn2(self.ffn2_norm(hidden_states)))
-        return self.final_norm(hidden_states)
+        normalised = self.attention_norm(hidden_states)
+        hidden_states = apply_mask(
+            hidden_states + self.attention_dropout(
+                self.attention(normalised, normalised, normalised, mask)
+            )
+        )
+        hidden_states = apply_mask(hidden_states + self.conv(hidden_states, mask))
+        hidden_states = apply_mask(
+            hidden_states + 0.5 * self.dropout(self.ffn2(self.ffn2_norm(hidden_states)))
+        )
+        return self.final_norm(apply_mask(hidden_states))
 
 
 class TransformerEncoder(nn.Module):
@@ -222,6 +233,8 @@ class TransformerEncoder(nn.Module):
 
     def forward(self, hidden_states: Tensor, mask: Tensor | None) -> Tensor:
         for layer in self.layers:
+            if mask is not None:
+                hidden_states = hidden_states * mask.unsqueeze(-1).to(hidden_states.dtype)
             if self.training and self.gradient_checkpointing:
                 hidden_states = checkpoint(
                     lambda states, current=layer: current(states, mask),
@@ -230,6 +243,8 @@ class TransformerEncoder(nn.Module):
                 )
             else:
                 hidden_states = layer(hidden_states, mask)
+            if mask is not None:
+                hidden_states = hidden_states * mask.unsqueeze(-1).to(hidden_states.dtype)
         if mask is not None:
             hidden_states = hidden_states * mask.unsqueeze(-1).to(hidden_states.dtype)
         return self.norm(hidden_states)
@@ -700,6 +715,50 @@ class TypedParameterExtractor(nn.Module):
         return result
 
 
+class BridgeAlignmentHead(nn.Module):
+    """Project semantic latents into the speech representation space."""
+
+    def __init__(self, d_model: int) -> None:
+        super().__init__()
+        self.projection = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.GELU(),
+            nn.Linear(d_model, d_model),
+        )
+
+    def forward(self, semantic_states: Tensor) -> Tensor:
+        return F.normalize(self.projection(semantic_states), dim=-1)
+
+
+class LexicalSpanResolver:
+    """Resolve CTC frame spans into UTF-8 text values at inference time."""
+
+    def __init__(self, vocabulary: Sequence[str], blank_id: int = 0) -> None:
+        if len(vocabulary) < 257 or vocabulary[blank_id] != "<BLANK>":
+            raise ValueError("lexical vocabulary must contain a blank and 256 byte tokens")
+        self.vocabulary = list(vocabulary)
+        self.blank_id = int(blank_id)
+
+    def resolve(self, logits: Tensor, start_frame: int, end_frame: int) -> str:
+        if logits.dim() != 2:
+            raise ValueError("lexical logits must have shape [frames, vocabulary]")
+        start = max(0, min(int(start_frame), logits.size(0) - 1))
+        end = max(start, min(int(end_frame), logits.size(0) - 1))
+        token_ids = logits[start : end + 1].argmax(-1).tolist()
+        values: list[int] = []
+        previous: int | None = None
+        for token_id in token_ids:
+            token_id = int(token_id)
+            if token_id == self.blank_id or token_id == previous:
+                previous = token_id
+                continue
+            if not 1 <= token_id <= 256:
+                raise ValueError(f"invalid lexical token id: {token_id}")
+            values.append(token_id - 1)
+            previous = token_id
+        return bytes(values).decode("utf-8", errors="replace").strip()
+
+
 class VoiceNativeSLU(nn.Module):
     """VALLS SLU V0: waveform -> semantic execution frame ingredients."""
 
@@ -720,7 +779,11 @@ class VoiceNativeSLU(nn.Module):
         self.act_head = nn.Linear(d_model, len(config["ontology"]["acts"]))
         self.confidence_head = nn.Linear(d_model, 3)
         self.ood_head = nn.Linear(d_model, 1)
+        self.bridge_alignment_head = BridgeAlignmentHead(d_model)
         lexical = config["lexical_branch"]
+        self.lexical_span_resolver = LexicalSpanResolver(
+            lexical["vocab"], int(lexical["blank_id"])
+        )
         self.lexical_head = nn.Linear(d_model, int(lexical["vocab_size"])) if lexical.get("enabled", True) else None
         self.apply(self._reset_parameters)
 
@@ -782,9 +845,14 @@ class VoiceNativeSLU(nn.Module):
             "goal_scores": self.schema_retriever(operation_queries, schemas, capability_embeddings),
             "action_scores": self.action_resolver(operation_queries, schemas),
             "parameter_outputs": self.parameter_extractor(operation_queries, encoded["speech_states"], schemas),
+            "bridge_states": self.bridge_alignment_head(semantic_states),
         }
         if self.lexical_head is not None:
+            # CTC stays on acoustic states for ACOUSTIC.  BRIDGE uses the
+            # bridge_states output and an explicit representation-alignment
+            # objective so the resampler receives a linguistic preservation signal.
             outputs["lexical_ctc_logits"] = self.lexical_head(encoded["speech_states"])
+            outputs["bridge_lexical_logits"] = self.lexical_head(encoded["semantic_states"])
         return outputs
 
 

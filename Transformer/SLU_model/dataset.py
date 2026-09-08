@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 import torch
 from torch import Tensor
@@ -50,6 +50,12 @@ def encode_lexical_text(text: str, vocab: Sequence[str] | None = None) -> list[i
     if len(active_vocab) < 257 or active_vocab[0] != "<BLANK>":
         raise DatasetContractError("lexical vocabulary must contain blank plus 256 byte tokens")
     return [byte + 1 for byte in text.encode("utf-8")]
+
+
+def ctc_target_length_is_valid(input_length: int, target_length: int) -> bool:
+    """Return whether a CTC target can fit the available timesteps."""
+
+    return int(target_length) <= int(input_length)
 
 
 def decode_lexical_ids(ids: Sequence[int], vocab: Sequence[str] | None = None) -> str:
@@ -94,6 +100,8 @@ def _validate_input_span(value: dict[str, Any], transcript: str | None) -> None:
         _validate_alignment({"alignment": {"start": value.get("start_ratio"), "end": value.get("end_ratio")}})
         if not isinstance(value.get("start_frame"), int) or not isinstance(value.get("end_frame"), int):
             raise DatasetContractError("predicted input_span requires integer frame bounds")
+        if not isinstance(value.get("value"), str) or not value["value"]:
+            raise DatasetContractError("predicted input_span requires a resolved lexical value")
         return
     start, end, text = value.get("start"), value.get("end"), value.get("value")
     if (
@@ -152,8 +160,18 @@ def _requires_transcript(target: dict[str, Any], config: dict[str, Any]) -> bool
     return False
 
 
-def validate_target(target: dict[str, Any], config: dict[str, Any], transcript: str | None = None) -> None:
+def validate_target(
+    target: dict[str, Any],
+    config: dict[str, Any],
+    transcript: str | None = None,
+    capability_schemas: Sequence[Mapping[str, Any]] | None = None,
+) -> None:
     acts = config["ontology"]["acts"]
+    schema_map = (
+        {str(schema["name"]): schema for schema in capability_schemas}
+        if capability_schemas is not None
+        else config["ontology"]["capabilities"]
+    )
     if target.get("act") not in acts:
         raise DatasetContractError(f"unknown ACT: {target.get('act')!r}")
     operations = target.get("operations", [])
@@ -169,9 +187,9 @@ def validate_target(target: dict[str, Any], config: dict[str, Any], transcript: 
         if operation.get("order", order) != order:
             raise DatasetContractError("operation order must be contiguous and 1-based")
         goal = operation.get("goal")
-        if goal not in config["ontology"]["capabilities"]:
+        if goal not in schema_map:
             raise DatasetContractError(f"unknown capability schema: {goal!r}")
-        schema = config["ontology"]["capabilities"][goal]
+        schema = schema_map[goal]
         action = operation.get("action")
         if action not in schema.get("actions", []):
             raise DatasetContractError(f"invalid action for {goal}: {action!r}")
@@ -230,6 +248,9 @@ class VoiceSLUDataset(Dataset[dict[str, Any]]):
         self.config = config
         self.audio_loader = audio_loader or self._default_audio_loader
         self.lexical_vocab = config["lexical_branch"]["vocab"]
+        self.sample_rate = int(config["audio"]["sample_rate"])
+        self.hop_length = int(config["audio"]["hop_length"])
+        self.subsampling_factor = int(config["speech_encoder"]["subsampling_factor"])
 
     @staticmethod
     def _default_audio_loader(audio: Any) -> Tensor:
@@ -251,13 +272,22 @@ class VoiceSLUDataset(Dataset[dict[str, Any]]):
         waveform = self.audio_loader(record["audio"])
         transcript = record.get("transcript")
         lexical_ids = encode_lexical_text(transcript or "", self.lexical_vocab)
+        estimated_input_frames = max(1, int(waveform.numel()) // self.hop_length + 1)
+        estimated_ctc_frames = max(1, (estimated_input_frames + self.subsampling_factor - 1) // self.subsampling_factor)
+        repeated_tokens = sum(left == right for left, right in zip(lexical_ids, lexical_ids[1:]))
+        required_ctc_frames = len(lexical_ids) + repeated_tokens
+        if not ctc_target_length_is_valid(estimated_ctc_frames, required_ctc_frames):
+            raise DatasetContractError(
+                f"lexical target is too long for CTC: target={len(lexical_ids)}, required={required_ctc_frames}, estimated_input={estimated_ctc_frames}"
+            )
         return {
             "sample_id": record["sample_id"],
             "waveform": waveform,
             "target": record["target"],
             "transcript": transcript,
             "lexical_labels": torch.tensor(lexical_ids, dtype=torch.long),
-            "lexical_input_length": None,
+            "estimated_ctc_input_length": estimated_ctc_frames,
+            "required_ctc_length": required_ctc_frames,
             "metadata": record.get("metadata", {}),
         }
 
@@ -283,6 +313,11 @@ def collate_audio_batch(items: Sequence[dict[str, Any]]) -> dict[str, Any]:
         "lexical_labels": torch.cat(labels) if any(label.numel() for label in labels) else torch.empty(0, dtype=torch.long),
         "lexical_target_lengths": torch.tensor([label.numel() for label in labels], dtype=torch.long),
         "metadata": [item["metadata"] for item in items],
+        "ctc_invalid_count": sum(
+            int(item["required_ctc_length"] > item["estimated_ctc_input_length"])
+            for item in items
+        ),
+        "ctc_sample_count": len(items),
     }
 
 
