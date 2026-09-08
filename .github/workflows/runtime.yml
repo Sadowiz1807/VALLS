@@ -1,0 +1,21 @@
+name: Runtime
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: python -m pip install -r requirements.txt
+      - run: python -m compileall -q Runtime Voice Tests
+      - run: python -m pip check
+      - run: python -m pytest -q Tests
+      - run: python -c "from pathlib import Path; from Runtime.Contracts.Validate import validate_registry; print(validate_registry(Path('Runtime/Registry'), Path('Runtime/Model/VSAD/0.0.4/config.json')))"
+      - run: git diff --check

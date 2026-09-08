@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Callable
 
 
-class System:
+class SystemProvider:
     NIGHT_LIGHT_ON_ID = "SystemSettings_Display_BlueLight_ManualToggleOn_Button"
     NIGHT_LIGHT_OFF_ID = "SystemSettings_Display_BlueLight_ManualToggleOff_Button"
     POWER_COMMANDS = {
@@ -25,7 +25,7 @@ class System:
     @staticmethod
     def _run(argv: list[str]) -> dict:
         if argv[:2] == ["rundll32.exe", "powrprof.dll,SetSuspendState"]:
-            suspended = System._suspend()
+            suspended = SystemProvider._suspend()
             return {"returncode": 0 if suspended else 1, "suspended": suspended,
                     "error": None if suspended else "SUSPEND_FAILED"}
         try:
@@ -108,11 +108,11 @@ class System:
             endpoint.SetMasterVolumeLevelScalar(value / 100, None)
             return {"observed": round(endpoint.GetMasterVolumeLevelScalar() * 100)}
         if operation == "night_light":
-            before = System._night_light_state()
+            before = SystemProvider._night_light_state()
             if before is not bool(value):
-                System._invoke_night_light()
+                SystemProvider._invoke_night_light()
                 time.sleep(1)
-            return {"observed": System._night_light_state()}
+            return {"observed": SystemProvider._night_light_state()}
         raise RuntimeError("BACKEND_UNAVAILABLE")
 
     @staticmethod
@@ -123,15 +123,15 @@ class System:
         while time.time() < deadline:
             for window in Desktop(backend="uia").windows(class_name="ApplicationFrameWindow"):
                 for control in window.descendants(control_type="Button"):
-                    if control.element_info.automation_id in (System.NIGHT_LIGHT_ON_ID, System.NIGHT_LIGHT_OFF_ID):
+                    if control.element_info.automation_id in (SystemProvider.NIGHT_LIGHT_ON_ID, SystemProvider.NIGHT_LIGHT_OFF_ID):
                         return control
             time.sleep(0.2)
         raise RuntimeError("NIGHT_LIGHT_CONTROL_NOT_FOUND")
 
     @staticmethod
     def _night_light_state() -> bool:
-        return System._night_light_control().element_info.automation_id == System.NIGHT_LIGHT_OFF_ID
+        return SystemProvider._night_light_control().element_info.automation_id == SystemProvider.NIGHT_LIGHT_OFF_ID
 
     @staticmethod
     def _invoke_night_light() -> None:
-        System._night_light_control().invoke()
+        SystemProvider._night_light_control().invoke()

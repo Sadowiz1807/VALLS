@@ -43,33 +43,57 @@ flowchart LR
 ### 2.1. Cấu trúc source và ownership
 
 ```text
-Skills/<Family>/Skill.md          # human-readable contract
-Runtime/Registry/*.json           # whitelist/config authority
-Runtime/Skills/<Family>.py        # workflow implementation
-Runtime/Resources/<Domain>.py     # atomic operations
+Skills/<Family>/Skill.md        # human-readable contract
+Runtime/Registry/skills.json    # workflow/input/risk authority
+Runtime/Registry/resources.json # atomic capability catalog
+Runtime/Registry/providers.json # approved provider declarations
+Runtime/Skills/Executor.py      # manifest-driven workflow execution
+Runtime/Resources/Dispatcher.py # capability dispatch
+Runtime/Providers/*.py          # OS/API/package implementations
 ```
 
-- `Skill.md` mô tả family, trường hợp dùng, keywords tham khảo, workflow IDs, resources, risk và điều cấm.
-- Registry là source of truth mà runtime đọc để quyết định app, browser, provider, alias, resource, `enabled` và config được phép.
-- Runtime không parse `Skill.md` để cấp quyền. Khi tài liệu và registry khác nhau, registry thắng và tài liệu phải được đồng bộ.
-- Một Python class có thể chứa nhiều workflow methods theo cùng domain; mỗi method vẫn map tới một `skill_id` riêng.
-- Mỗi resource method vẫn map tới một public `resource_id` nguyên tử.
+- `Skill.md` mô tả behavior cho người đọc; runtime không parse file này để cấp quyền.
+- Ontology VSAD pin `contract_version=2.0` và `release_version=0.0.4` là semantic authority; Registry là machine-readable authority cho workflow, resource, provider và risk.
+- `SkillExecutor` resolve named linear steps và explicit `resource_by_action`; không suy resource từ suffix.
+- `ResourceDispatcher` enforce typed contract, effective risk và single-use `ConfirmationGrant` trước provider boundary.
+- Provider health được kiểm tại dispatch time; fallback chỉ cho lỗi allowlisted khi `side_effect_state=NOT_STARTED`.
+- Target như YouTube, Spotify và Facebook là entity/data; target không quyết định Python implementation.
 
-Ví dụ:
+Luồng runtime:
 
 ```text
-Runtime/Skills/WebControl.py
-class WebControl
-  open()       → web.open
-  change_tab() → tab.manage
-
-Runtime/Resources/Browser.py
-class Browser
-  open()       → browser.navigation.open
-  switch_tab() → browser.tabs.switch
+semantic frame
+→ SkillExecutor
+→ resource_id
+→ ResourceDispatcher
+→ ProviderRegistry
+→ available provider
+→ observed result
 ```
 
-Tên class/file là implementation detail PascalCase; public ID vẫn dùng lowercase dot notation.
+### 2.2 Browser transport inventory
+
+| Transport | Artifact/process owner | Health probe | Mutation | Trạng thái |
+|---|---|---|---|---|
+| Extension | Không tìm thấy package, manifest, native host hoặc bridge | Không có | Không | `BLOCKED_ARTIFACT_NOT_FOUND` |
+| CDP | Không có Runtime-owned Chromium session/profile contract | Không có | Không | `BLOCKED_SESSION_CONTRACT_NOT_FOUND` |
+| UIA | `Runtime/Providers/Browser.py`; current Runtime process không sở hữu browser session | Không có ownership probe đủ mạnh cho mutation | Không expose title-only close | `BLOCKED_OWNERSHIP_NOT_PROVEN` |
+
+Không register Extension/CDP placeholder. UIA healthy không đồng nghĩa hỗ trợ mọi browser resource; title-only identity không đủ quyền mutate/close.
+
+### 2.3 Capability và UAT hiện tại
+
+| Capability | Implementation | Semantic | Evidence |
+|---|---|---|---|
+| `WEB_SEARCH` | stdlib URL builder + existing browser open | reachable | automated GREEN; session-only Chrome observation, chưa có durable UAT artifact |
+| Browser navigate/tab session | typed declarations `enabled=false` | blocked | thiếu Runtime-owned transport/session |
+| Application open/close | Windows provider, session-local PID/window ownership | reachable theo route hiện có | deterministic ownership/reused-handle tests GREEN |
+| Spotify PLAY | native Spotipy resolve → exact URI → playback → read-back | reachable khi provider healthy | automated GREEN; live UAT blocked vì không có active Connect target |
+| Spotify STOP | không implement | fail-closed trước Dispatcher | `SKILL_NOT_AVAILABLE`, zero attempts |
+| Voice VAD/STT | NumPy RMS VAD, half-duplex capture lifecycle | internal input pipeline | deterministic lifecycle/VAD tests GREEN; mic/model UAT chưa chạy |
+| Windows master volume | không implement qua media | blocked | ontology migration chưa có |
+
+Public ID dùng lowercase dot notation; tên class, language và package của provider là implementation detail.
 
 ## 3. Ranh giới Model và Runtime
 
@@ -99,7 +123,7 @@ action=OPEN
 → application.open
 ```
 
-Runtime dùng raw input, semantic frame, state, registry và availability. Model không cần biết `application.open` là ID gì hoặc workflow có bao nhiêu bước.
+Runtime route `GOAL + action` sang skill từ semantic frame. Provider availability không được đổi semantic hoặc fallback ứng dụng local sang web.
 
 ## 4. Resource catalog
 
@@ -115,11 +139,11 @@ Resource catalog là foundation để build skill. Mỗi hàng là một public 
 | `window.control.<list|focus>` | Resolve và focus cửa sổ |
 | `media.catalog.<search|resolve>` | Resolve media item |
 | `media.playback.<play|pause|resume|stop|next|previous>` | Điều khiển media session |
-| `audio.volume.<get|set|increase|decrease>` | Điều khiển âm lượng |
+| `audio.volume.<get|set|increase|decrease>` | Nội bộ; chưa semantic-reachable cho đến khi media-volume contract được chốt |
 | `browser.state.<active|tabs>` | Đọc browser và tab state |
 | `browser.navigation.<open|search|back|forward|refresh|scroll|home>` | Điều hướng web |
 | `browser.tabs.<new|close|switch|reopen>` | Quản lý tab |
-| `system.command.<lock|shutdown|restart|sleep|screenshot>` | Built-in OS commands allowlisted |
+| `system.command.<lock|shutdown|restart|sleep|screenshot>` | Legacy internal resources; `RUN_COMMAND` chưa có runtime skill |
 | `task.store.<last|active>` | Truy vấn task state |
 | `response.renderer.<pre|clarify|confirm|success|failure>` | Sinh response grounded |
 | `speech.asr.transcribe` | Chuyển audio thành text |
@@ -288,7 +312,7 @@ Skill risk không được thấp hơn resource risk cao nhất mà workflow g�
 ```text
 1. Reject ACT không cho phép side effect.
 2. Filter skill theo GOAL và generic action.
-3. Filter theo enabled resources và runtime availability.
+3. Chọn route semantic đã khai báo; unavailable semantic trả `SKILL_NOT_AVAILABLE`.
 4. Match exact aliases/entity catalogs.
 5. Match normalized tokens.
 6. Match fuzzy text nếu cần.
@@ -318,23 +342,23 @@ Local embedding là optional optimization; skill system không phụ thuộc m�
 |---|---|---|---|---|
 | `media.play` | `MEDIA_CONTROL/PLAY` | optional `query`, `platform` | media catalog, playback | resolve source/item → play |
 | `media.transport` | PAUSE/RESUME/STOP/NEXT/PREVIOUS | `action` | media playback | resolve active session → apply action |
-| `media.volume` | `MEDIA_CONTROL` volume actions hoặc `RUN_COMMAND/SET_VOLUME` | `action`, optional `volume` | audio volume | normalize command → validate level → apply |
+| `media.volume` | Chưa semantic-reachable | `action`, optional `volume` | audio volume | Chờ chốt ontology/runtime contract |
 
 ### 9.3. Web and browser skills
 
 | Skill ID | Semantic compatibility | Inputs | Resources | Workflow |
 |---|---|---|---|---|
 | `web.open` | `WEB_OPEN` | `target`, optional `browser` | browser state/navigation | resolve browser/target → open |
-| `web.search` | `WEB_SEARCH` | `query`, optional `engine` | browser navigation | resolve engine → construct safe search → open |
-| `web.navigate` | `WEB_NAVIGATE` | `action`, optional `amount` | browser state/navigation | validate active browser → navigate |
-| `tab.manage` | `TAB_CONTROL` | `action`, optional tab selector | browser state/tabs | resolve tab if needed → apply action |
+| `web.search` | `WEB_SEARCH` | `query`, optional `engine` | search URL builder, browser navigation | build allowlisted URL → open |
+| `web.navigate` | `WEB_NAVIGATE` | — | — | Chưa có runtime workflow; fail closed |
+| `tab.manage` | `TAB_CONTROL` | — | — | Chưa có runtime workflow; fail closed |
 
 ### 9.4. System and task skills
 
 | Skill ID | Semantic compatibility | Inputs | Resources | Workflow |
 |---|---|---|---|---|
-| `system.command` | `RUN_COMMAND` | `command_id`, typed `arguments` | system command, confirmation store | allowlist → confirmation policy → execute |
-| `task.status` | `TASK_STATUS` | optional `scope` | task store | query state → render status |
+| `system.command` | `RUN_COMMAND` | — | — | Chưa có runtime skill; fail closed |
+| `task.status` | `TASK_STATUS` | — | — | Chưa có runtime workflow; fail closed |
 
 Built-in system command policy:
 

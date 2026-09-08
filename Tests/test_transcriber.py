@@ -6,6 +6,7 @@ import numpy as np
 
 from Voice import VoiceProcess
 from Voice.transcriber import Transcriber
+from Voice.vad import VadConfig, UtteranceSegmenter
 
 
 def test_default_voice_uses_parakeet():
@@ -54,12 +55,33 @@ def test_no_speech_skips_model():
     assert transcriber.transcribe(np.zeros(16000, dtype=np.float32)) == ("", "vi", 0.0)
 
 
+def test_vad_rejects_noise_and_finalizes_valid_speech_once():
+    vad = UtteranceSegmenter(VadConfig(
+        sample_rate=8000, frame_ms=20, noise_calibration_ms=40,
+        min_start_frames=2, pre_roll_ms=20, min_speech_ms=40, silence_ms=60,
+    ))
+    frame = lambda level: np.full(160, level, dtype=np.float32)
+    outputs = [audio for level in [0.01, 0.01, 0.1, 0.1, 0.1, 0.01, 0.01, 0.01]
+               for audio in vad.feed(frame(level))]
+
+    assert len(outputs) == 1
+    assert vad.flush() is None
+
+
 def test_voice_transcribes_only_after_explicit_stop():
     events = []
-    voice = VoiceProcess(on_event=lambda event: events.append(event))
+    voice = VoiceProcess(
+        on_event=lambda event: events.append(event),
+        vad_config=VadConfig(noise_calibration_ms=40, min_start_frames=2,
+                             min_speech_ms=40, silence_ms=500),
+    )
 
     class Capture:
         sample_rate = 16000
+
+        def __init__(self):
+            frame = lambda level: np.full(320, level, dtype=np.float32)
+            self.chunks = iter([frame(0.01), frame(0.01), frame(0.1), frame(0.1), frame(0.1)])
 
         def start(self):
             pass
@@ -67,7 +89,7 @@ def test_voice_transcribes_only_after_explicit_stop():
         def poll(self, timeout=0.1):
             if voice._stop.is_set():
                 return None
-            return np.ones(160, dtype=np.float32) * 0.1
+            return next(self.chunks, None)
 
         def stop(self):
             pass
@@ -87,9 +109,107 @@ def test_voice_transcribes_only_after_explicit_stop():
     voice.start()
 
     import time
-    time.sleep(0.02)
-    assert [event.event for event in events] == ["VOICE_STARTED"]
+    deadline = time.time() + 1
+    while time.time() < deadline and not any(event.event == "VOICE_SPEECH_STARTED" for event in events):
+        time.sleep(0.005)
+    assert not any(event.event == "VOICE_FINAL" for event in events)
     voice.stop()
 
-    assert [event.event for event in events] == ["VOICE_STARTED", "VOICE_FINAL"]
+    assert [event.event for event in events] == ["VOICE_STARTED", "VOICE_SPEECH_STARTED", "VOICE_FINAL"]
     assert events[-1].text == "Mở Spotify"
+
+
+def test_voice_recovers_after_stt_error_with_distinct_utterance_ids():
+    import time
+
+    frame = lambda level: np.full(320, level, dtype=np.float32)
+    turn = [frame(x) for x in [0.01, 0.01, 0.1, 0.1, 0.1, 0.01, 0.01, 0.01]]
+    captures = [iter(turn), iter(turn), iter(())]
+    events = []
+
+    class Capture:
+        sample_rate = 16000
+
+        def __init__(self):
+            self.chunks = captures.pop(0)
+
+        def start(self): pass
+        def stop(self): pass
+        def poll(self, timeout=0.1):
+            return next(self.chunks, None)
+
+    class STT:
+        model_name = "stub"
+        calls = 0
+
+        def load(self): return self
+        def transcribe(self, _audio):
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("STT_FAILED")
+            return "lượt hai", "vi", 0.9
+
+    voice = VoiceProcess(
+        capture_factory=Capture, transcriber=STT(), on_event=events.append,
+        vad_config=VadConfig(noise_calibration_ms=40, min_start_frames=2,
+                             min_speech_ms=40, silence_ms=60),
+    )
+    voice.start()
+    deadline = time.time() + 1
+    while time.time() < deadline and len([e for e in events if e.event in {"VOICE_ERROR", "VOICE_FINAL"}]) < 2:
+        time.sleep(0.005)
+    voice.stop()
+
+    terminal = [e for e in events if e.event in {"VOICE_ERROR", "VOICE_FINAL"}]
+    assert [e.event for e in terminal] == ["VOICE_ERROR", "VOICE_FINAL"]
+    assert len({e.utterance_id for e in terminal}) == 2
+
+
+def test_voice_callback_failure_does_not_emit_second_terminal_event():
+    events = []
+
+    def callback(event):
+        events.append(event)
+        if event.event == "VOICE_FINAL":
+            raise RuntimeError("consumer failed after accepting final")
+
+    class Capture:
+        def stop(self): pass
+
+    class STT:
+        model_name = "stub"
+        def transcribe(self, _audio): return "xong", "vi", 0.9
+
+    voice = VoiceProcess(capture_factory=Capture, transcriber=STT(), on_event=callback)
+    voice._finalize(np.ones(320, dtype=np.float32), restart=False)
+
+    assert [event.event for event in events] == ["VOICE_FINAL"]
+
+
+def test_voice_start_is_idempotent_while_worker_is_alive():
+    import time
+
+    events = []
+
+    class Capture:
+        sample_rate = 16000
+        starts = 0
+        def start(self): self.starts += 1
+        def stop(self): pass
+        def poll(self, timeout=0.1):
+            time.sleep(0.005)
+            return None
+
+    class STT:
+        model_name = "stub"
+        def load(self): return self
+
+    capture = Capture()
+    voice = VoiceProcess(capture_factory=lambda: capture, transcriber=STT(), on_event=events.append)
+    voice.start()
+    voice.start()
+    time.sleep(0.02)
+    voice.stop()
+
+    assert capture.starts == 1
+    assert [event.event for event in events].count("VOICE_STARTED") == 1
