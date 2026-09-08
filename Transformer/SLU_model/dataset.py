@@ -1,343 +1,290 @@
-"""Canonical records to masked multi-task labels."""
+"""Dataset boundaries for the voice-native VALLS SLU V0 model.
+
+The V0 corpus is waveform-first.  Transcript text is not the semantic input,
+but it is required for ENTITY/FREE_TEXT lexical supervision.  Span targets use
+normalized speech-frame ratios produced by a forced aligner, so they remain
+valid after batching and convolutional subsampling.
+"""
 
 from __future__ import annotations
 
 import json
-import re
-from typing import Any, Sequence
+from pathlib import Path
+from typing import Any, Callable, Sequence
 
 import torch
 from torch import Tensor
 from torch.utils.data import Dataset
 
-from .config import ABSENT, INPUT_SPAN, NONE, STATE_REFERENCE
+from .config import default_lexical_vocab, validate_config
 
-IGNORE_INDEX = -100
-PREMATURE_SUCCESS_PATTERNS = (
-    r"\bđã\s+(được\s+)?(mở|đóng|phát|dừng|chuyển|tìm|truy cập|thực hiện|chạy|cuộn|tải)\b",
-    r"\b(mở|đóng|phát|dừng|chuyển|tìm|truy cập|thực hiện|chạy|cuộn|tải)\b.*\b(rồi|xong|hoàn tất)\b",
-    r"\bđã\b.*\b(thành công|xong|hoàn tất)\b",
-    r"\b(opened|closed|played|stopped|searched|navigated|executed|launched|downloaded|completed|done|successfully)\b",
-)
+
+class DatasetContractError(ValueError):
+    """Raised when a record cannot be trusted as a VALLS training example."""
 
 
 def canonical_json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
-def serialize_model_input(
-    record: dict[str, Any], special_tokens: dict[str, str],
-    context: Sequence[dict[str, Any]] | None = None,
-) -> str:
-    state = {
-        key: record["state"][key]
-        for key in ("current_target_application", "active_media", "active_url", "active_browser")
-        if key in record["state"]
-    }
-    if isinstance(record["state"].get("source_active_frames"), list):
-        state["source_active_frames"] = record["state"]["source_active_frames"][-1:]
-    metadata = {
-        key: record["metadata"][key]
-        for key in ("language_mode", "locale", "asr_noise")
-        if key in record["metadata"]
-    }
-    return "".join([
-        special_tokens["context_open"], canonical_json(record["context"] if context is None else context), special_tokens["context_close"],
-        special_tokens["state_open"], canonical_json(state), special_tokens["state_close"],
-        special_tokens["metadata_open"], canonical_json(metadata), special_tokens["metadata_close"],
-        special_tokens["input_open"], record["current_text"], special_tokens["input_close"],
-    ])
+def load_jsonl(path: str | Path) -> list[dict[str, Any]]:
+    source = Path(path)
+    records: list[dict[str, Any]] = []
+    for line_number, line in enumerate(source.read_text(encoding="utf-8").splitlines(), 1):
+        if not line.strip():
+            continue
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError as error:
+            raise DatasetContractError(f"invalid JSON at {source}:{line_number}") from error
+        if not isinstance(record, dict):
+            raise DatasetContractError(f"record at {source}:{line_number} must be an object")
+        records.append(record)
+    return records
 
 
-def _token_span(offsets: list[tuple[int, int]], start: int, end: int) -> tuple[int, int]:
-    indices = [index for index, (left, right) in enumerate(offsets) if right > start and left < end]
-    if not indices:
-        raise ValueError(f"Character span [{start}, {end}) does not align to any input token")
-    if offsets[indices[0]][0] != start or offsets[indices[-1]][1] != end:
-        raise ValueError(f"Character span [{start}, {end}) does not match exact token boundaries")
-    return indices[0], indices[-1]
+def encode_lexical_text(text: str, vocab: Sequence[str] | None = None) -> list[int]:
+    """Encode UTF-8 bytes as ids 1..256; id 0 is the CTC blank."""
+
+    active_vocab = list(vocab or default_lexical_vocab())
+    if len(active_vocab) < 257 or active_vocab[0] != "<BLANK>":
+        raise DatasetContractError("lexical vocabulary must contain blank plus 256 byte tokens")
+    return [byte + 1 for byte in text.encode("utf-8")]
 
 
-def _validate_source_span(value: dict[str, Any], text: str) -> None:
-    start, end = value.get("start"), value.get("end")
-    if not isinstance(start, int) or not isinstance(end, int) or not 0 <= start < end <= len(text):
-        raise ValueError("input_span requires valid character start/end")
-    if value.get("value") != text[start:end]:
-        raise ValueError("input_span value must equal the source text slice")
+def decode_lexical_ids(ids: Sequence[int], vocab: Sequence[str] | None = None) -> str:
+    """Decode greedy lexical ids, ignoring CTC blank and repeated ids."""
+
+    active_vocab = list(vocab or default_lexical_vocab())
+    if len(active_vocab) < 257:
+        raise DatasetContractError("lexical vocabulary is incomplete")
+    bytes_out: list[int] = []
+    previous = None
+    for index in ids:
+        index = int(index)
+        if index == 0 or index == previous:
+            previous = index
+            continue
+        if not 1 <= index <= 256:
+            raise DatasetContractError(f"invalid lexical token id: {index}")
+        bytes_out.append(index - 1)
+        previous = index
+    return bytes(bytes_out).decode("utf-8", errors="replace")
 
 
-def validate_response_target(record: dict[str, Any]) -> None:
-    text = record.get("gold_response_text")
-    metadata = record.get("response_metadata")
-    if not isinstance(text, str) or not text.strip():
-        raise ValueError("gold_response_text must be a non-empty string")
-    if not isinstance(metadata, dict):
-        raise ValueError("response_metadata must be an object")
-    if metadata.get("owner") != "dataset_gold" or metadata.get("model_generated") is not False:
-        raise ValueError("Gold responses require owner=dataset_gold and model_generated=false")
-    target = record.get("target", {})
-    if target.get("mapping_status") == "CANDIDATE":
-        target = target.get("canonical_semantic", {})
-    act = target.get("act")
-    expected_phase = "pre_execution" if act == "EXECUTE" else "direct_response"
-    if metadata.get("phase") != expected_phase:
-        raise ValueError(f"{act} response phase must be {expected_phase}")
-    if not isinstance(metadata.get("provenance"), str) or not metadata["provenance"]:
-        raise ValueError("response_metadata.provenance is required")
-    if act == "EXECUTE" and any(
-        re.search(pattern, text, re.IGNORECASE) for pattern in PREMATURE_SUCCESS_PATTERNS
+def _validate_alignment(value: dict[str, Any]) -> None:
+    alignment = value.get("alignment")
+    if not isinstance(alignment, dict):
+        raise DatasetContractError("input_span requires alignment={start,end} ratios")
+    start, end = alignment.get("start"), alignment.get("end")
+    if (
+        isinstance(start, bool)
+        or not isinstance(start, (int, float))
+        or isinstance(end, bool)
+        or not isinstance(end, (int, float))
+        or not 0 <= float(start) < float(end) <= 1
     ):
-        raise ValueError("EXECUTE pre-execution response must not claim success")
+        raise DatasetContractError("alignment ratios must satisfy 0 <= start < end <= 1")
 
 
-def validate_generated_response(response_text: str, act: str) -> str:
-    """Reject unsafe model text before it reaches the user or executor."""
-    response_text = response_text.strip()
-    if not response_text:
-        raise ValueError("Model generated an empty response")
-    if act == "EXECUTE" and any(
-        re.search(pattern, response_text, re.IGNORECASE)
-        for pattern in PREMATURE_SUCCESS_PATTERNS
+def _validate_input_span(value: dict[str, Any], transcript: str | None) -> None:
+    # Inference frames use speech-frame ratios; supervised records additionally
+    # carry transcript character offsets for lexical/span alignment.
+    if transcript is None and "start_frame" in value:
+        _validate_alignment({"alignment": {"start": value.get("start_ratio"), "end": value.get("end_ratio")}})
+        if not isinstance(value.get("start_frame"), int) or not isinstance(value.get("end_frame"), int):
+            raise DatasetContractError("predicted input_span requires integer frame bounds")
+        return
+    start, end, text = value.get("start"), value.get("end"), value.get("value")
+    if (
+        isinstance(start, bool)
+        or not isinstance(start, int)
+        or isinstance(end, bool)
+        or not isinstance(end, int)
+        or start < 0
+        or end <= start
+        or not isinstance(text, str)
+        or not text
     ):
-        raise ValueError("EXECUTE response contains a premature success claim")
-    return response_text
+        raise DatasetContractError("input_span requires start, end and non-empty value")
+    if transcript is None:
+        raise DatasetContractError("input_span requires transcript")
+    if text != transcript[start:end]:
+        raise DatasetContractError("input_span value must equal transcript[start:end]")
+    _validate_alignment(value)
 
 
-def _parameter_labels(
-    target: dict[str, Any], text: str, serialized_offsets: list[tuple[int, int]],
-    input_char_start: int, config: dict[str, Any],
-) -> tuple[dict[str, Tensor], dict[str, Tensor]]:
-    goal = target.get("goal")
-    categorical = {
-        key: torch.tensor(IGNORE_INDEX, dtype=torch.long)
-        for key in config["heads"]["categorical"]
-    }
-    spans = {
-        key: torch.tensor([IGNORE_INDEX, IGNORE_INDEX], dtype=torch.long)
-        for key in config["heads"]["spans"]
-    }
-    if goal not in config["ontology"]["goal_parameters"]:
-        return categorical, spans
-
-    parameters = target.get("parameters", {})
-    specification = config["ontology"]["goal_parameters"][goal]
-    for name, parameter_spec in specification["properties"].items():
-        key = f"{goal}__{name}"
-        value = parameters.get(name, ABSENT)
-        if parameter_spec.get("type") == "dynamic":
-            source_key = f"{key}__source"
-            if value == ABSENT:
-                label = ABSENT
-            elif not isinstance(value, dict):
-                raise ValueError(f"{key} must be a typed dynamic value")
-            elif value.get("source") == "input_span":
-                _validate_source_span(value, text)
-                label = INPUT_SPAN
-                local = _token_span(
-                    serialized_offsets,
-                    input_char_start + value["start"],
-                    input_char_start + value["end"],
-                )
-                spans[key] = torch.tensor([local[0] + 1, local[1] + 1], dtype=torch.long)
-            elif value.get("source") == "state_reference":
-                paths = config["heads"]["references"].get(key, [])
-                if value.get("path") not in paths:
-                    raise ValueError(f"Non-allowlisted state reference for {key}")
-                label = STATE_REFERENCE
-                categorical[f"{key}__reference"] = torch.tensor(
-                    paths.index(value["path"]), dtype=torch.long
-                )
-            else:
-                raise ValueError(f"Unknown dynamic source for {key}")
-            categorical[source_key] = torch.tensor(
-                config["heads"]["categorical"][source_key].index(label), dtype=torch.long
-            )
-        elif name == "tab_index":
-            source_key = f"{key}__source"
-            if value == ABSENT:
-                categorical[source_key] = torch.tensor(0, dtype=torch.long)
-            else:
-                matches = list(re.finditer(rf"(?<!\d){int(value)}(?!\d)", text))
-                if len(matches) != 1:
-                    raise ValueError("tab_index must appear exactly once in current_text")
-                match = matches[0]
-                local = _token_span(
-                    serialized_offsets,
-                    input_char_start + match.start(),
-                    input_char_start + match.end(),
-                )
-                spans[key] = torch.tensor([local[0] + 1, local[1] + 1])
-                categorical[source_key] = torch.tensor(
-                    config["heads"]["categorical"][source_key].index(INPUT_SPAN)
-                )
-        elif name == "arguments":
-            if value != ABSENT and value is not None and value != {}:
-                raise ValueError("RUN_COMMAND.arguments requires a command-specific schema")
-        elif key in categorical:
-            label = str(value) if value != ABSENT else ABSENT
-            try:
-                categorical[key] = torch.tensor(
-                    config["heads"]["categorical"][key].index(label), dtype=torch.long
-                )
-            except ValueError as exc:
-                raise ValueError(f"Invalid categorical value {label!r} for {key}") from exc
-    return categorical, spans
+def _validate_parameter(goal: str, name: str, value: Any, schema: dict[str, Any], transcript: str | None) -> None:
+    parameter_type = schema["type"]
+    if parameter_type == "ENUM":
+        if value not in schema["values"]:
+            raise DatasetContractError(f"invalid enum value for {goal}.{name}: {value!r}")
+    elif parameter_type == "NUMBER":
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise DatasetContractError(f"{goal}.{name} must be numeric")
+        if "minimum" in schema and value < schema["minimum"]:
+            raise DatasetContractError(f"{goal}.{name} is below minimum")
+        if "maximum" in schema and value > schema["maximum"]:
+            raise DatasetContractError(f"{goal}.{name} is above maximum")
+    elif parameter_type == "BOOLEAN":
+        if not isinstance(value, bool):
+            raise DatasetContractError(f"{goal}.{name} must be boolean")
+    elif parameter_type in {"ENTITY", "FREE_TEXT"}:
+        if not isinstance(value, dict) or value.get("source") != "input_span":
+            raise DatasetContractError(f"{goal}.{name} must use an input_span value")
+        _validate_input_span(value, transcript)
+    elif parameter_type == "STATE_REFERENCE":
+        if not isinstance(value, dict) or value.get("source") != "state_reference":
+            raise DatasetContractError(f"{goal}.{name} must use a state_reference value")
+        if value.get("path") not in schema.get("state_reference_paths", []):
+            raise DatasetContractError(f"state reference is not allowlisted for {goal}.{name}")
 
 
-class MultiTaskDataset(Dataset):
-    def __init__(self, records: Sequence[dict[str, Any]], tokenizer: Any, config: dict[str, Any]) -> None:
+def _requires_transcript(target: dict[str, Any], config: dict[str, Any]) -> bool:
+    for operation in target.get("operations", []):
+        goal = operation.get("goal")
+        if goal not in config["ontology"]["capabilities"]:
+            continue
+        schemas = config["ontology"]["capabilities"][goal]["parameters"]
+        for name, value in operation.get("parameters", {}).items():
+            if schemas.get(name, {}).get("type") in {"ENTITY", "FREE_TEXT"} and isinstance(value, dict) and value.get("source") == "input_span":
+                return True
+    return False
+
+
+def validate_target(target: dict[str, Any], config: dict[str, Any], transcript: str | None = None) -> None:
+    acts = config["ontology"]["acts"]
+    if target.get("act") not in acts:
+        raise DatasetContractError(f"unknown ACT: {target.get('act')!r}")
+    operations = target.get("operations", [])
+    if not isinstance(operations, list):
+        raise DatasetContractError("target.operations must be a list")
+    maximum = int(config["operation_decoder"]["max_operations"])
+    if len(operations) > maximum:
+        raise DatasetContractError(f"target contains more than {maximum} operations")
+
+    for order, operation in enumerate(operations, 1):
+        if not isinstance(operation, dict):
+            raise DatasetContractError("each operation must be an object")
+        if operation.get("order", order) != order:
+            raise DatasetContractError("operation order must be contiguous and 1-based")
+        goal = operation.get("goal")
+        if goal not in config["ontology"]["capabilities"]:
+            raise DatasetContractError(f"unknown capability schema: {goal!r}")
+        schema = config["ontology"]["capabilities"][goal]
+        action = operation.get("action")
+        if action not in schema.get("actions", []):
+            raise DatasetContractError(f"invalid action for {goal}: {action!r}")
+        parameters = operation.get("parameters", {})
+        if not isinstance(parameters, dict):
+            raise DatasetContractError("operation.parameters must be an object")
+        parameter_schemas = schema["parameters"]
+        extra = set(parameters) - set(parameter_schemas)
+        if extra:
+            raise DatasetContractError(f"unknown parameters for {goal}: {sorted(extra)}")
+        for name, parameter_schema in parameter_schemas.items():
+            if name not in parameters:
+                if parameter_schema.get("required"):
+                    raise DatasetContractError(f"missing required parameter {goal}.{name}")
+                continue
+            _validate_parameter(goal, name, parameters[name], parameter_schema, transcript)
+
+    if target["act"] == "EXECUTE" and not operations:
+        raise DatasetContractError("EXECUTE requires at least one operation")
+    if target["act"] != "EXECUTE" and operations:
+        raise DatasetContractError("non-EXECUTE targets cannot contain operations")
+
+
+def validate_record(record: dict[str, Any], config: dict[str, Any]) -> None:
+    required = {"sample_id", "audio", "target"}
+    missing = required - set(record)
+    if missing:
+        raise DatasetContractError(f"record is missing fields: {sorted(missing)}")
+    if not isinstance(record["sample_id"], str) or not record["sample_id"]:
+        raise DatasetContractError("sample_id must be a non-empty string")
+    audio = record["audio"]
+    if not isinstance(audio, (str, list, tuple, Tensor)):
+        raise DatasetContractError("audio must be a path, waveform sequence or Tensor")
+    if isinstance(audio, Tensor) and (audio.dim() != 1 or audio.numel() < 2):
+        raise DatasetContractError("audio Tensor must have shape [samples]")
+    if isinstance(audio, (list, tuple)) and len(audio) < 2:
+        raise DatasetContractError("audio sequence must contain at least two samples")
+    if not isinstance(record["target"], dict):
+        raise DatasetContractError("target must be an object")
+    transcript = record.get("transcript")
+    if transcript is not None and not isinstance(transcript, str):
+        raise DatasetContractError("transcript must be a string when provided")
+    if _requires_transcript(record["target"], config) and not transcript:
+        raise DatasetContractError("transcript is required for ENTITY/FREE_TEXT input spans")
+    validate_target(record["target"], config, transcript)
+
+
+class VoiceSLUDataset(Dataset[dict[str, Any]]):
+    """Waveform dataset adapter with transcript and lexical supervision."""
+
+    def __init__(self, records: Sequence[dict[str, Any]], config: dict[str, Any], audio_loader: Callable[[Any], Tensor] | None = None) -> None:
+        validate_config(config)
         for record in records:
-            missing_fields = set(config["data"]["required_fields"]) - set(record)
-            if missing_fields:
-                raise ValueError(f"Record is missing required fields: {sorted(missing_fields)}")
-            if not isinstance(record["current_text"], str) or not record["current_text"]:
-                raise ValueError("current_text must be a non-empty string")
-            if not isinstance(record["context"], list) or not isinstance(record["state"], dict) or not isinstance(record["metadata"], dict):
-                raise ValueError("context/state/metadata have invalid types")
-            target = record.get("target", {})
-            if "mapping_status" in target and target.get("mapping_status") != "CANDIDATE":
-                raise ValueError("MultiTaskDataset accepts only CANDIDATE records")
-            validate_response_target(record)
-        self.records = records
-        self.tokenizer = tokenizer
+            validate_record(record, config)
+        self.records = list(records)
         self.config = config
-        special = config["tokenizer"]["special_tokens"]
-        self.bos_id = tokenizer.token_to_id(special["bos"])
-        self.eos_id = tokenizer.token_to_id(special["eos"])
-        self.pad_id = tokenizer.token_to_id(special["pad"])
-        if None in {self.bos_id, self.eos_id, self.pad_id}:
-            raise ValueError("Tokenizer is missing BOS/EOS/PAD")
+        self.audio_loader = audio_loader or self._default_audio_loader
+        self.lexical_vocab = config["lexical_branch"]["vocab"]
+
+    @staticmethod
+    def _default_audio_loader(audio: Any) -> Tensor:
+        if isinstance(audio, Tensor):
+            waveform = audio.detach().clone().float()
+        elif isinstance(audio, (list, tuple)):
+            waveform = torch.tensor(audio, dtype=torch.float32)
+        else:
+            raise DatasetContractError("an audio_loader is required for path-based audio records")
+        if waveform.dim() != 1 or waveform.numel() < 2:
+            raise DatasetContractError("loaded waveform must have shape [samples]")
+        return waveform
 
     def __len__(self) -> int:
         return len(self.records)
 
     def __getitem__(self, index: int) -> dict[str, Any]:
         record = self.records[index]
-        target_container = record["target"]
-        if target_container.get("mapping_status") == "CANDIDATE":
-            target = target_container.get("canonical_semantic")
-            if not isinstance(target, dict):
-                raise ValueError("CANDIDATE requires target.canonical_semantic")
-        else:
-            target = target_container
-        act = target["act"]
-        goal = target.get("goal") or NONE
-        if act not in self.config["labels"]["acts"]:
-            raise ValueError(f"Unknown ACT: {act}")
-        if goal not in self.config["labels"]["goals"]:
-            raise ValueError(f"Unknown GOAL: {goal}")
-        if goal not in self.config["labels"]["goal_masks_by_act"][act]:
-            raise ValueError(f"GOAL {goal} is incompatible with ACT {act}")
-        parameters = target.get("parameters", {})
-        if not isinstance(parameters, dict):
-            raise ValueError("target.parameters must be an object")
-        specification = self.config["ontology"]["goal_parameters"].get(target.get("goal"), {})
-        properties = specification.get("properties", {})
-        extra = set(parameters) - set(properties)
-        missing = set(specification.get("required", [])) - set(parameters)
-        if extra or missing:
-            raise ValueError(f"Invalid parameters: extra={sorted(extra)}, missing={sorted(missing)}")
-
-        context = record["context"]
-        serialized = serialize_model_input(
-            record, self.config["tokenizer"]["special_tokens"], context
-        )
-        full_encoding = self.tokenizer.encode(serialized)
-        maximum = int(self.config["model"]["max_input_length"])
-        while context and len(full_encoding.ids) + 2 > maximum:
-            context = context[1:]
-            serialized = serialize_model_input(
-                record, self.config["tokenizer"]["special_tokens"], context
-            )
-            full_encoding = self.tokenizer.encode(serialized)
-        input_char_start = serialized.rindex(record["current_text"])
-        ids = [self.bos_id, *full_encoding.ids, self.eos_id]
-        if len(ids) > maximum:
-            raise ValueError(f"Input requires {len(ids)} tokens, maximum is {maximum}")
-        ids.extend([self.pad_id] * (maximum - len(ids)))
-        labels, spans = _parameter_labels(
-            target,
-            record["current_text"],
-            full_encoding.offsets,
-            input_char_start,
-            self.config,
-        )
-        text_end = input_char_start + len(record["current_text"])
-        token_offsets = [(-1, -1)]
-        token_offsets.extend(
-            (left - input_char_start, right - input_char_start)
-            if left >= input_char_start and right <= text_end else (-1, -1)
-            for left, right in full_encoding.offsets
-        )
-        token_offsets.append((-1, -1))
-        token_offsets.extend([(-1, -1)] * (maximum - len(token_offsets)))
-        input_ids = torch.tensor(ids, dtype=torch.long)
-        response_text = record["gold_response_text"].strip()
-        response_ids = self.tokenizer.encode(response_text).ids
-        response_maximum = int(self.config["model"]["max_response_length"])
-        if len(response_ids) + 1 > response_maximum:
-            raise ValueError(
-                f"Response requires {len(response_ids) + 1} tokens, maximum is {response_maximum}"
-            )
-        # Dynamic response tokens (unpadded at item level, padded dynamically in collate_batch)
-        decoder_input_ids = [self.bos_id, *response_ids]
-        response_labels = [*response_ids, self.eos_id]
+        waveform = self.audio_loader(record["audio"])
+        transcript = record.get("transcript")
+        lexical_ids = encode_lexical_text(transcript or "", self.lexical_vocab)
         return {
-            "input_ids": input_ids,
-            "token_offsets": torch.tensor(token_offsets, dtype=torch.long),
-            "input_mask": (input_ids != self.pad_id).unsqueeze(0).unsqueeze(0),
-            "act_label": torch.tensor(self.config["labels"]["acts"].index(act)),
-            "goal_label": torch.tensor(self.config["labels"]["goals"].index(goal)),
-            "categorical_labels": labels,
-            "span_labels": spans,
-            "decoder_input_ids": torch.tensor(decoder_input_ids, dtype=torch.long),
-            "response_labels": torch.tensor(response_labels, dtype=torch.long),
-            "gold_response_text": response_text,
-            "response_metadata": record["response_metadata"],
-            "text": record["current_text"],
-            "target": target,
+            "sample_id": record["sample_id"],
+            "waveform": waveform,
+            "target": record["target"],
+            "transcript": transcript,
+            "lexical_labels": torch.tensor(lexical_ids, dtype=torch.long),
+            "lexical_input_length": None,
+            "metadata": record.get("metadata", {}),
         }
 
 
-def collate_batch(items: list[dict[str, Any]]) -> dict[str, Any]:
-    # ponytail: dynamic padding for decoder sequence (min 64, max 1024, batch-aligned)
-    max_dec_len = max(len(item["decoder_input_ids"]) for item in items)
-    batch_dec_len = min(1024, max(64, max_dec_len))
-    pad_id = 0  # unigram bytelevel pad
-    ignore_index = IGNORE_INDEX
-
-    padded_dec_inputs = []
-    padded_resp_labels = []
-    resp_masks = []
-
-    for item in items:
-        dec_ids = item["decoder_input_ids"].tolist()
-        resp_lbls = item["response_labels"].tolist()
-        cur_len = len(dec_ids)
-        pad_len = max(0, batch_dec_len - cur_len)
-        padded_dec_inputs.append(torch.tensor(dec_ids[:batch_dec_len] + [pad_id] * pad_len, dtype=torch.long))
-        padded_resp_labels.append(torch.tensor(resp_lbls[:batch_dec_len] + [ignore_index] * pad_len, dtype=torch.long))
-        resp_masks.append(torch.tensor([True] * min(cur_len, batch_dec_len) + [False] * pad_len, dtype=torch.bool))
-
+def collate_audio_batch(items: Sequence[dict[str, Any]]) -> dict[str, Any]:
+    if not items:
+        raise ValueError("cannot collate an empty batch")
+    lengths = [int(item["waveform"].numel()) for item in items]
+    maximum = max(lengths)
+    waveform = torch.zeros(len(items), maximum, dtype=torch.float32)
+    audio_mask = torch.zeros(len(items), maximum, dtype=torch.bool)
+    for row, item in enumerate(items):
+        values = item["waveform"].float()
+        waveform[row, : values.numel()] = values
+        audio_mask[row, : values.numel()] = True
+    labels = [item["lexical_labels"] for item in items]
     return {
-        "input_ids": torch.stack([item["input_ids"] for item in items]),
-        "token_offsets": torch.stack([item["token_offsets"] for item in items]),
-        "input_mask": torch.stack([item["input_mask"] for item in items]),
-        "act_label": torch.stack([item["act_label"] for item in items]),
-        "goal_label": torch.stack([item["goal_label"] for item in items]),
-        "categorical_labels": {
-            key: torch.stack([item["categorical_labels"][key] for item in items])
-            for key in items[0]["categorical_labels"]
-        },
-        "span_labels": {
-            key: torch.stack([item["span_labels"][key] for item in items])
-            for key in items[0]["span_labels"]
-        },
-        "decoder_input_ids": torch.stack(padded_dec_inputs),
-        "response_labels": torch.stack(padded_resp_labels),
-        "response_mask": torch.stack(resp_masks),
-        "gold_response_text": [item["gold_response_text"] for item in items],
-        "response_metadata": [item["response_metadata"] for item in items],
-        "text": [item["text"] for item in items],
+        "waveform": waveform,
+        "audio_mask": audio_mask,
+        "sample_id": [item["sample_id"] for item in items],
         "target": [item["target"] for item in items],
+        "transcript": [item["transcript"] for item in items],
+        "lexical_labels": torch.cat(labels) if any(label.numel() for label in labels) else torch.empty(0, dtype=torch.long),
+        "lexical_target_lengths": torch.tensor([label.numel() for label in labels], dtype=torch.long),
+        "metadata": [item["metadata"] for item in items],
     }
+
+
+MultiTaskDataset = VoiceSLUDataset
+collate_batch = collate_audio_batch

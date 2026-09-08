@@ -1,495 +1,323 @@
-"""Loss, inference assembly, training loop, checkpointing and four-file packages."""
+"""Training, staged optimization, evaluation and package I/O for VALLS SLU V0.
+
+The training code produces semantic execution-frame ingredients only.  It does
+not train or generate response text; Response Module runs after a grounded
+Harness result.
+"""
 
 from __future__ import annotations
 
 import copy
 import json
-import math
+from enum import Enum
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping, Sequence
 
 import torch
 import torch.nn.functional as F
 from safetensors.torch import load_model as load_safetensors
 from safetensors.torch import save_model as save_safetensors
-from tokenizers import Tokenizer
 from torch import Tensor
 from tqdm.auto import tqdm
 
-from .config import ABSENT, INPUT_SPAN, NONE, STATE_REFERENCE, validate_config
-from .dataset import IGNORE_INDEX, validate_generated_response
-from .model import MultiTaskTransformer, build_model
+from .config import validate_config
+from .dataset import DatasetContractError, validate_target
+from .model import VoiceNativeSLU, build_model
+
+IGNORE_INDEX = -100
 
 
-def _active_cross_entropy(logits: Tensor, labels: Tensor) -> Tensor | None:
+class TrainingStage(str, Enum):
+    """Supported V0 curriculum stages."""
+
+    ACOUSTIC = "ACOUSTIC"
+    BRIDGE = "BRIDGE"
+    SEMANTIC = "SEMANTIC"
+    PARAMETER = "PARAMETER"
+    SAFETY = "SAFETY"
+    JOINT = "JOINT"
+
+
+_STAGE_MODULES: dict[TrainingStage, set[str]] = {
+    TrainingStage.ACOUSTIC: {"speech_encoder"},
+    TrainingStage.BRIDGE: {"speech_encoder", "semantic_resampler"},
+    TrainingStage.SEMANTIC: {"semantic_resampler", "semantic_core", "operation_decoder", "schema_encoder", "schema_retriever", "action_resolver", "act_head"},
+    TrainingStage.PARAMETER: {"semantic_resampler", "semantic_core", "operation_decoder", "schema_encoder", "schema_retriever", "action_resolver", "parameter_extractor"},
+    TrainingStage.SAFETY: {"semantic_core", "confidence_head", "ood_head"},
+    TrainingStage.JOINT: {"speech_encoder", "semantic_resampler", "semantic_core", "operation_decoder", "schema_encoder", "schema_retriever", "action_resolver", "parameter_extractor", "act_head", "confidence_head", "ood_head", "lexical_head"},
+}
+
+
+def _move_batch(batch: Mapping[str, Any], device: torch.device) -> dict[str, Any]:
+    return {key: value.to(device) if isinstance(value, Tensor) else value for key, value in batch.items()}
+
+
+def _cross_entropy(logits: Tensor, labels: Tensor) -> Tensor | None:
     active = labels != IGNORE_INDEX
     return F.cross_entropy(logits[active], labels[active]) if active.any() else None
 
 
-def compute_loss(
-    outputs: dict[str, Any], batch: dict[str, Any], config: dict[str, Any]
-) -> tuple[Tensor, dict[str, Tensor]]:
-    act_logits = outputs["act_logits"]
-    goal_logits = outputs["goal_logits"].clone()
-    acts = config["labels"]["acts"]
-    goals = config["labels"]["goals"]
-    for row, act_label in enumerate(batch["act_label"].tolist()):
-        allowed = {goals.index(goal) for goal in config["labels"]["goal_masks_by_act"][acts[act_label]]}
-        blocked = [index for index in range(len(goals)) if index not in allowed]
-        goal_logits[row, blocked] = torch.finfo(goal_logits.dtype).min
-    losses: dict[str, Tensor] = {
-        "act": F.cross_entropy(act_logits, batch["act_label"]),
-        "goal": F.cross_entropy(goal_logits, batch["goal_label"]),
-    }
+def _runtime_schemas(outputs: Mapping[str, Any]) -> list[dict[str, Any]]:
+    schemas = outputs.get("capability_schemas")
+    if not isinstance(schemas, list) or not schemas:
+        raise DatasetContractError("model output has no runtime capability schemas")
+    return schemas
+
+
+def _target_act_ids(batch: Mapping[str, Any], config: Mapping[str, Any], device: torch.device) -> Tensor:
+    acts = config["ontology"]["acts"]
+    return torch.tensor([acts.index(target["act"]) for target in batch["target"]], dtype=torch.long, device=device)
+
+
+def _target_operation_presence(batch: Mapping[str, Any], max_operations: int, device: torch.device) -> Tensor:
+    return torch.tensor(
+        [[index < len(target.get("operations", [])) for index in range(max_operations)] for target in batch["target"]],
+        dtype=torch.float32,
+        device=device,
+    )
+
+
+def _target_ood(batch: Mapping[str, Any], device: torch.device) -> Tensor:
+    # OOD is an explicit binary safety label, never a guessed confidence value.
+    return torch.tensor(
+        [float(bool(target.get("ood", target.get("act") == "UNSUPPORTED"))) for target in batch["target"]],
+        dtype=torch.float32,
+        device=device,
+    )
+
+
+def _target_confidence(batch: Mapping[str, Any], device: torch.device) -> tuple[Tensor, Tensor]:
+    """Return confidence targets and a mask; missing calibration labels are ignored."""
+
+    values: list[list[float]] = []
+    mask: list[list[float]] = []
+    for target in batch["target"]:
+        confidence = target.get("confidence")
+        if not isinstance(confidence, Mapping):
+            values.append([0.0, 0.0, 0.0])
+            mask.append([0.0, 0.0, 0.0])
+            continue
+        row = [confidence.get(key) for key in ("act", "goal", "parameters")]
+        values.append([float(item) if item is not None else 0.0 for item in row])
+        mask.append([1.0 if item is not None else 0.0 for item in row])
+    return (
+        torch.tensor(values, dtype=torch.float32, device=device),
+        torch.tensor(mask, dtype=torch.float32, device=device),
+    )
+
+
+def _schema_index(schemas: Sequence[Mapping[str, Any]], name: str) -> int:
+    for index, schema in enumerate(schemas):
+        if schema.get("name") == name:
+            return index
+    raise DatasetContractError(f"target capability is not in the runtime schema set: {name}")
+
+
+def _parameter_loss(
+    outputs: Mapping[str, Any],
+    batch: Mapping[str, Any],
+    schemas: Sequence[Mapping[str, Any]],
+    config: Mapping[str, Any],
+) -> list[Tensor]:
+    """Train shared typed extractors from runtime schemas, not goal modules."""
+
+    device = outputs["operation_queries"].device
+    max_operations = int(config["operation_decoder"]["max_operations"])
     parameter_losses: list[Tensor] = []
-    for key, logits in outputs["categorical_logits"].items():
-        loss = _active_cross_entropy(logits, batch["categorical_labels"][key])
-        if loss is not None:
-            parameter_losses.append(loss)
-    for key, start_logits in outputs["span_start_logits"].items():
-        labels = batch["span_labels"][key]
-        start_loss = _active_cross_entropy(start_logits, labels[:, 0])
-        end_loss = _active_cross_entropy(outputs["span_end_logits"][key], labels[:, 1])
-        if start_loss is not None and end_loss is not None:
-            parameter_losses.append((start_loss + end_loss) / 2)
-    losses["parameters"] = (
-        torch.stack(parameter_losses).mean()
-        if parameter_losses
-        else outputs["act_logits"].sum() * 0
-    )
-    if "response_logits" not in outputs:
-        raise ValueError("Training requires response_logits")
-    losses["response"] = F.cross_entropy(
-        outputs["response_logits"].transpose(1, 2),
-        batch["response_labels"],
-        ignore_index=IGNORE_INDEX,
-        label_smoothing=float(config["training"].get("label_smoothing", 0.0)),
-    )
+    for schema in schemas:
+        goal = str(schema["name"])
+        outputs_for_goal = outputs["parameter_outputs"].get(goal, {})
+        for name, parameter in schema.get("parameters", {}).items():
+            head = outputs_for_goal.get(name)
+            if head is None:
+                raise DatasetContractError(f"missing shared parameter output for {goal}.{name}")
+            for operation_index in range(max_operations):
+                presence_labels: list[float] = []
+                active_values: list[Any] = []
+                active_rows: list[int] = []
+                for row, target in enumerate(batch["target"]):
+                    operations = target.get("operations", [])
+                    value = None
+                    if operation_index < len(operations) and operations[operation_index].get("goal") == goal:
+                        value = operations[operation_index].get("parameters", {}).get(name)
+                    presence_labels.append(float(value is not None))
+                    if value is not None:
+                        active_rows.append(row)
+                        active_values.append(value)
+                parameter_losses.append(
+                    F.cross_entropy(
+                        head["presence_logits"][:, operation_index],
+                        torch.tensor(presence_labels, dtype=torch.long, device=device),
+                    )
+                )
+                if not active_rows:
+                    continue
+                rows = torch.tensor(active_rows, dtype=torch.long, device=device)
+                parameter_type = str(parameter["type"])
+                if parameter_type == "ENUM":
+                    labels = torch.tensor(
+                        [parameter["values"].index(value) for value in active_values],
+                        dtype=torch.long,
+                        device=device,
+                    )
+                    parameter_losses.append(F.cross_entropy(head["enum_logits"][rows, operation_index], labels))
+                elif parameter_type == "NUMBER":
+                    labels = torch.tensor([float(value) for value in active_values], dtype=torch.float32, device=device)
+                    parameter_losses.append(F.smooth_l1_loss(head["number_value"][rows, operation_index], labels))
+                elif parameter_type == "BOOLEAN":
+                    labels = torch.tensor([int(value) for value in active_values], dtype=torch.long, device=device)
+                    parameter_losses.append(F.cross_entropy(head["boolean_logits"][rows, operation_index], labels))
+                elif parameter_type == "STATE_REFERENCE":
+                    labels = torch.tensor(
+                        [parameter["state_reference_paths"].index(value["path"]) for value in active_values],
+                        dtype=torch.long,
+                        device=device,
+                    )
+                    parameter_losses.append(F.cross_entropy(head["reference_logits"][rows, operation_index], labels))
+                elif parameter_type in {"ENTITY", "FREE_TEXT"}:
+                    start_ratios: list[float] = []
+                    end_ratios: list[float] = []
+                    for value in active_values:
+                        if not isinstance(value, dict) or value.get("source") != "input_span":
+                            raise DatasetContractError(f"{goal}.{name} requires an input_span target")
+                        alignment = value.get("alignment")
+                        if not isinstance(alignment, Mapping):
+                            raise DatasetContractError(f"{goal}.{name} requires frame alignment")
+                        start_ratios.append(float(alignment["start"]))
+                        end_ratios.append(float(alignment["end"]))
+                    start_logits = head["span_start_logits"][rows, operation_index]
+                    end_logits = head["span_end_logits"][rows, operation_index]
+                    frame_count = start_logits.size(-1)
+                    start_labels = torch.tensor(start_ratios, device=device).mul(frame_count - 1).round().long().clamp(0, frame_count - 1)
+                    end_labels = torch.tensor(end_ratios, device=device).mul(frame_count - 1).round().long().clamp(0, frame_count - 1)
+                    parameter_losses.extend([F.cross_entropy(start_logits, start_labels), F.cross_entropy(end_logits, end_labels)])
+    return parameter_losses
+
+
+def compute_loss(
+    outputs: Mapping[str, Any],
+    batch: Mapping[str, Any],
+    config: Mapping[str, Any],
+    enabled_losses: set[str] | None = None,
+) -> tuple[Tensor, dict[str, Tensor]]:
+    """Compute staged V0 semantic losses."""
+
+    enabled = enabled_losses or set(config["training"]["loss_weights"])
+    device = outputs["act_logits"].device
+    schemas = _runtime_schemas(outputs)
+    losses: dict[str, Tensor] = {}
+    zero = outputs["act_logits"].sum() * 0.0
+
+    if "act" in enabled:
+        losses["act"] = F.cross_entropy(outputs["act_logits"], _target_act_ids(batch, config, device))
+    if "operation_presence" in enabled:
+        labels = _target_operation_presence(batch, int(config["operation_decoder"]["max_operations"]), device)
+        losses["operation_presence"] = F.binary_cross_entropy_with_logits(outputs["operation_presence_logits"], labels)
+    if "goal_retrieval" in enabled:
+        labels: list[int] = []
+        logits: list[Tensor] = []
+        for row, target in enumerate(batch["target"]):
+            for operation_index, operation in enumerate(target.get("operations", [])):
+                labels.append(_schema_index(schemas, str(operation["goal"])))
+                logits.append(outputs["goal_scores"][row, operation_index])
+        losses["goal_retrieval"] = F.cross_entropy(torch.stack(logits), torch.tensor(labels, dtype=torch.long, device=device)) if logits else zero
+    if "action" in enabled:
+        labels = []
+        logits = []
+        for row, target in enumerate(batch["target"]):
+            for operation_index, operation in enumerate(target.get("operations", [])):
+                schema_index = _schema_index(schemas, str(operation["goal"]))
+                schema = schemas[schema_index]
+                actions = list(schema.get("actions", []))
+                if operation.get("action") not in actions:
+                    raise DatasetContractError(f"invalid action for {schema['name']}: {operation.get('action')}")
+                labels.append(actions.index(operation["action"]))
+                logits.append(outputs["action_scores"][schema_index][row, operation_index])
+        losses["action"] = F.cross_entropy(torch.stack(logits), torch.tensor(labels, dtype=torch.long, device=device)) if logits else zero
+    if "parameters" in enabled:
+        values = _parameter_loss(outputs, batch, schemas, config)
+        losses["parameters"] = torch.stack(values).mean() if values else zero
+    if "confidence" in enabled:
+        values, mask = _target_confidence(batch, device)
+        error = (outputs["confidence_logits"].sigmoid() - values).square()
+        losses["confidence"] = (error * mask).sum() / mask.sum().clamp_min(1.0)
+    if "ood" in enabled:
+        losses["ood"] = F.binary_cross_entropy_with_logits(outputs["ood_logit"], _target_ood(batch, device))
+    if "lexical" in enabled:
+        if "lexical_ctc_logits" not in outputs or "lexical_labels" not in batch:
+            losses["lexical"] = zero
+        else:
+            log_probs = outputs["lexical_ctc_logits"].log_softmax(-1).transpose(0, 1)
+            input_lengths = outputs["speech_mask"].sum(1).long()
+            losses["lexical"] = F.ctc_loss(
+                log_probs,
+                batch["lexical_labels"].to(device),
+                input_lengths.to(device),
+                batch["lexical_target_lengths"].to(device),
+                blank=int(config["lexical_branch"]["blank_id"]),
+                zero_infinity=True,
+            )
+
+    if not losses:
+        raise ValueError("no enabled training losses")
     weights = config["training"]["loss_weights"]
-    total = sum(losses[name] * float(weights[name]) for name in losses)
+    total = sum(loss * float(weights.get(name, 1.0)) for name, loss in losses.items())
     return total, losses
 
 
-def _move_batch(batch: dict[str, Any], device: torch.device) -> dict[str, Any]:
-    moved = {
-        key: value.to(device) if isinstance(value, Tensor) else value
-        for key, value in batch.items()
-    }
-    moved["categorical_labels"] = {
-        key: value.to(device) for key, value in batch["categorical_labels"].items()
-    }
-    moved["span_labels"] = {
-        key: value.to(device) for key, value in batch["span_labels"].items()
-    }
-    return moved
+def configure_stage(model: VoiceNativeSLU, stage: TrainingStage | str) -> None:
+    """Freeze all modules not owned by a curriculum stage."""
+
+    selected = TrainingStage(stage)
+    trainable = _STAGE_MODULES[selected]
+    for name, module in model.named_children():
+        enabled = name in trainable
+        for parameter in module.parameters():
+            parameter.requires_grad = enabled
 
 
-def macro_f1(gold: list[int], predicted: list[int], labels: Iterable[int]) -> float:
-    scores = []
-    for label in labels:
-        tp = sum(g == label and p == label for g, p in zip(gold, predicted))
-        fp = sum(g != label and p == label for g, p in zip(gold, predicted))
-        fn = sum(g == label and p != label for g, p in zip(gold, predicted))
-        if tp + fp + fn:
-            scores.append(2 * tp / (2 * tp + fp + fn))
-    return sum(scores) / len(scores) if scores else 0.0
-
-
-def validate_model(
-    model: MultiTaskTransformer,
-    batches: Iterable[dict[str, Any]],
-    config: dict[str, Any],
-    device: torch.device,
-) -> dict[str, float]:
-    model.eval()
-    counts = {
-        "samples": 0, "act_correct": 0, "unsafe": 0, "non_execute_total": 0,
-        "parameter_total": 0, "parameter_correct": 0,
-        "span_total": 0, "span_correct": 0,
-        "reference_total": 0, "reference_correct": 0,
-        "response_total": 0, "response_correct": 0,
-    }
-    losses: list[float] = []
-    response_losses: list[float] = []
-    goal_gold: list[int] = []
-    goal_predicted: list[int] = []
-    acts, goals = config["labels"]["acts"], config["labels"]["goals"]
-    execute_id = acts.index("EXECUTE")
-
-    use_amp = device.type == "cuda" and config["training"]["precision"] == "fp16_mixed"
-    with torch.no_grad():
-        for raw_batch in batches:
-            batch = _move_batch(raw_batch, device)
-            with torch.amp.autocast(device_type=device.type, enabled=use_amp):
-                outputs = model(
-                    batch["input_ids"], batch["input_mask"],
-                    batch["decoder_input_ids"], batch["response_mask"],
-                )
-                loss, parts = compute_loss(outputs, batch, config)
-            batch_size = len(batch["act_label"])
-            losses.append(float(loss) * batch_size)
-            response_losses.append(float(parts["response"]) * batch_size)
-
-            active_response = batch["response_labels"] != IGNORE_INDEX
-            response_predictions = outputs["response_logits"].argmax(-1)
-            counts["response_total"] += int(active_response.sum())
-            counts["response_correct"] += int(
-                ((response_predictions == batch["response_labels"]) & active_response).sum()
-            )
-
-            act_predictions = outputs["act_logits"].argmax(-1)
-            goal_logits = outputs["goal_logits"].clone()
-            for row, act_id in enumerate(act_predictions.tolist()):
-                allowed = {
-                    goals.index(goal)
-                    for goal in config["labels"]["goal_masks_by_act"][acts[act_id]]
-                }
-                blocked = [index for index in range(len(goals)) if index not in allowed]
-                goal_logits[row, blocked] = torch.finfo(goal_logits.dtype).min
-            goal_predictions = goal_logits.argmax(-1)
-
-            counts["samples"] += len(act_predictions)
-            counts["act_correct"] += int((act_predictions == batch["act_label"]).sum())
-            counts["unsafe"] += int(
-                ((act_predictions == execute_id) & (batch["act_label"] != execute_id)).sum()
-            )
-            counts["non_execute_total"] += int((batch["act_label"] != execute_id).sum())
-            goal_gold.extend(batch["goal_label"].tolist())
-            goal_predicted.extend(goal_predictions.tolist())
-
-            for key, logits in outputs["categorical_logits"].items():
-                labels_for_head = batch["categorical_labels"][key]
-                active = labels_for_head != IGNORE_INDEX
-                correct = int((logits.argmax(-1)[active] == labels_for_head[active]).sum())
-                counts["parameter_total"] += int(active.sum())
-                counts["parameter_correct"] += correct
-                if key.endswith("__reference"):
-                    counts["reference_total"] += int(active.sum())
-                    counts["reference_correct"] += correct
-
-            for key, start_logits in outputs["span_start_logits"].items():
-                labels_for_head = batch["span_labels"][key]
-                active = labels_for_head[:, 0] != IGNORE_INDEX
-                exact = (
-                    (start_logits.argmax(-1) == labels_for_head[:, 0])
-                    & (outputs["span_end_logits"][key].argmax(-1) == labels_for_head[:, 1])
-                    & active
-                )
-                counts["span_total"] += int(active.sum())
-                counts["span_correct"] += int(exact.sum())
-
-    if not losses:
-        raise ValueError("No validation batches")
-
-    def ratio(correct: str, total: str) -> float:
-        return counts[correct] / counts[total] if counts[total] else 0.0
-
-    return {
-        "validation_loss": sum(losses) / counts["samples"],
-        "act_accuracy": ratio("act_correct", "samples"),
-        "goal_macro_f1": macro_f1(goal_gold, goal_predicted, range(len(goals))),
-        "parameter_accuracy": ratio("parameter_correct", "parameter_total"),
-        "span_exact_match": ratio("span_correct", "span_total"),
-        "state_reference_accuracy": ratio("reference_correct", "reference_total"),
-        "unsafe_false_execute_rate": ratio("unsafe", "non_execute_total"),
-        "response_token_accuracy": ratio("response_correct", "response_total"),
-        "response_perplexity": math.exp(min(sum(response_losses) / counts["samples"], 20.0)),
-    }
-
-
-def targets_reached(metrics: dict[str, float], targets: dict[str, float]) -> bool:
-    missing = set(targets) - set(metrics)
-    if missing:
-        raise ValueError(f"Missing target metrics: {sorted(missing)}")
-    maximum_targets = {
-        "unsafe_false_execute_rate",
-        "response_empty_rate",
-        "response_truncation_rate",
-        "premature_success_claim_rate",
-        "invalid_frame_rate",
-    }
-    return all(
-        metrics[name] <= target if name in maximum_targets else metrics[name] >= target
-        for name, target in targets.items()
+def build_stage_optimizer(
+    model: VoiceNativeSLU,
+    config: Mapping[str, Any],
+    stage: TrainingStage | str,
+) -> torch.optim.Optimizer:
+    selected = TrainingStage(stage)
+    multiplier = float(config["training"]["stages"][selected.value]["learning_rate_multiplier"])
+    parameters = [parameter for parameter in model.parameters() if parameter.requires_grad]
+    if not parameters:
+        raise ValueError(f"training stage {selected.value} has no trainable parameters")
+    return torch.optim.AdamW(
+        parameters,
+        lr=float(config["training"]["learning_rate"]) * multiplier,
+        weight_decay=float(config["training"]["weight_decay"]),
     )
-
-
-def _masked_argmax(logits: Tensor, allowed: list[int]) -> tuple[int, float]:
-    probabilities = logits.softmax(-1)
-    mask = torch.zeros_like(probabilities, dtype=torch.bool)
-    mask[..., allowed] = True
-    probabilities = probabilities.masked_fill(~mask, 0)
-    index = int(probabilities.argmax(-1).item())
-    return index, float(probabilities[..., index].item())
-
-
-def predict(
-    model: MultiTaskTransformer,
-    batch: dict[str, Any],
-    config: dict[str, Any],
-) -> dict[str, Any]:
-    if batch["input_ids"].shape[0] != 1:
-        raise ValueError("predict accepts exactly one sample")
-    model.eval()
-    with torch.no_grad():
-        outputs = model(batch["input_ids"], batch["input_mask"])
-    act_probabilities = outputs["act_logits"].softmax(-1)
-    act_id = int(act_probabilities.argmax(-1).item())
-    act = config["labels"]["acts"][act_id]
-    act_confidence = float(act_probabilities[0, act_id].item())
-    if act_confidence < float(config["inference"]["act_threshold"]):
-        return {
-            "act": "UNSUPPORTED",
-            "goal": None,
-            "parameters": {},
-            "confidence": {"act": act_confidence},
-        }
-    allowed_goals = [
-        config["labels"]["goals"].index(goal)
-        for goal in config["labels"]["goal_masks_by_act"][act]
-    ]
-    goal_id, goal_confidence = _masked_argmax(outputs["goal_logits"][0], allowed_goals)
-    goal = config["labels"]["goals"][goal_id]
-    if goal_confidence < float(config["inference"]["goal_threshold"]):
-        return {
-            "act": "UNSUPPORTED",
-            "goal": None,
-            "parameters": {},
-            "confidence": {"act": act_confidence, "goal": goal_confidence},
-        }
-    result: dict[str, Any] = {
-        "act": act,
-        "goal": None if goal == NONE else goal,
-        "parameters": {},
-        "confidence": {
-            "act": float(outputs["act_logits"].softmax(-1)[0, act_id].item()),
-            "goal": goal_confidence,
-        },
-    }
-    if goal == NONE:
-        return result
-    specification = config["ontology"]["goal_parameters"].get(goal, {})
-    for name, parameter in specification.get("properties", {}).items():
-        key = f"{goal}__{name}"
-        head_key = f"{key}__source" if parameter.get("type") == "dynamic" else key
-        if head_key not in outputs["categorical_logits"]:
-            continue
-        labels = config["heads"]["categorical"][head_key]
-        label_id = int(outputs["categorical_logits"][head_key].argmax(-1).item())
-        value = labels[label_id]
-        parameter_confidence = float(
-            outputs["categorical_logits"][head_key].softmax(-1)[0, label_id].item()
-        )
-        result["confidence"][key] = parameter_confidence
-        if parameter_confidence < float(config["inference"]["parameter_threshold"]):
-            result["act"] = "ASK_CLARIFICATION"
-            result["parameters"] = {}
-            return result
-        if value == ABSENT:
-            continue
-        if value == INPUT_SPAN:
-            start_logits = outputs["span_start_logits"][key][0]
-            offsets = batch["token_offsets"][0].to(start_logits.device)
-            valid = offsets[:, 0] >= 0
-            start_scores = start_logits.masked_fill(
-                ~valid, torch.finfo(start_logits.dtype).min
-            )
-            start_token = int(start_scores.argmax().item())
-            end_scores = outputs["span_end_logits"][key][0].clone()
-            end_scores[~valid] = torch.finfo(end_scores.dtype).min
-            end_scores[:start_token] = torch.finfo(end_scores.dtype).min
-            end_token = int(end_scores.argmax().item())
-            start = int(offsets[start_token, 0].item())
-            end = int(offsets[end_token, 1].item())
-            text = batch["text"][0]
-            span_value = text[start:end]
-            result["parameters"][name] = (
-                int(span_value)
-                if name == "tab_index"
-                else {
-                    "source": "input_span",
-                    "start": start,
-                    "end": end,
-                    "value": span_value,
-                }
-            )
-        elif value == STATE_REFERENCE:
-            reference_key = f"{key}__reference"
-            reference_id = int(outputs["categorical_logits"][reference_key].argmax(-1).item())
-            path = config["heads"]["categorical"][reference_key][reference_id]
-            result["parameters"][name] = {"source": "state_reference", "path": path}
-        elif parameter.get("type") == "integer":
-            result["parameters"][name] = int(value)
-        else:
-            result["parameters"][name] = value
-    return result
-
-
-def generate_response(
-    model: MultiTaskTransformer,
-    batch: dict[str, Any],
-    tokenizer: Tokenizer,
-    config: dict[str, Any],
-    semantic_frame: dict[str, Any],
-) -> dict[str, Any]:
-    """Greedy autoregressive response generation for one encoded sample."""
-    if batch["input_ids"].shape[0] != 1:
-        raise ValueError("generate_response accepts exactly one sample")
-    special = config["tokenizer"]["special_tokens"]
-    bos_id = tokenizer.token_to_id(special["bos"])
-    eos_id = tokenizer.token_to_id(special["eos"])
-    if bos_id is None or eos_id is None:
-        raise ValueError("Tokenizer is missing BOS/EOS")
-    maximum = int(config["model"]["max_response_length"])
-    blocked_ids = {
-        tokenizer.token_to_id(token)
-        for name, token in special.items()
-        if name != "eos"
-    }
-    blocked_ids.discard(None)
-    model.eval()
-    use_amp = batch["input_ids"].device.type == "cuda" and config["training"]["precision"] == "fp16_mixed"
-    with torch.no_grad():
-        with torch.amp.autocast(device_type=batch["input_ids"].device.type, enabled=use_amp):
-            memory = model.encode(batch["input_ids"], batch["input_mask"])
-        token_ids = [bos_id]
-        for _ in range(maximum):
-            decoder_ids = torch.tensor([token_ids], device=memory.device, dtype=torch.long)
-            response_mask = torch.ones_like(decoder_ids, dtype=torch.bool)
-            with torch.amp.autocast(device_type=memory.device.type, enabled=use_amp):
-                decoded = model.decode(decoder_ids, memory, response_mask, batch["input_mask"])
-                logits = model.response_head(decoded[:, -1])
-            if blocked_ids:
-                logits[:, list(blocked_ids)] = torch.finfo(logits.dtype).min
-            next_id = int(logits.argmax(-1).item())
-            token_ids.append(next_id)
-            if next_id == eos_id:
-                break
-    content_ids = token_ids[1:-1] if token_ids[-1] == eos_id else token_ids[1:]
-    response_text = validate_generated_response(
-        tokenizer.decode(content_ids), semantic_frame["act"]
-    )
-    return {
-        "response_text": response_text,
-        "token_ids": token_ids,
-        "response_metadata": {
-            "owner": "multi_task_transformer_v2",
-            "model_generated": True,
-            "terminated_by_eos": token_ids[-1] == eos_id,
-        },
-    }
-
-
-def evaluate_generation(
-    model: MultiTaskTransformer,
-    batches: Iterable[dict[str, Any]],
-    tokenizer: Tokenizer,
-    config: dict[str, Any],
-    device: torch.device,
-) -> dict[str, float]:
-    """Run locked-test autoregressive response gates one sample at a time."""
-    counts = {"samples": 0, "eos": 0, "empty": 0, "truncated": 0, "consistent": 0, "premature": 0, "invalid_frame": 0}
-    maximum = int(config["model"]["max_response_length"])
-    for raw_batch in batches:
-        batch = _move_batch(raw_batch, device)
-        if batch["input_ids"].shape[0] != 1:
-            raise ValueError("Generation evaluation requires batch_size=1")
-        counts["samples"] += 1
-        try:
-            use_amp = device.type == "cuda" and config["training"]["precision"] == "fp16_mixed"
-            with torch.amp.autocast(device_type=device.type, enabled=use_amp):
-                prediction = predict(model, batch, config)
-            frame = assemble_frame(prediction, config)
-            generated = generate_response(model, batch, tokenizer, config, frame)
-        except ValueError as error:
-            counts["empty"] += int("empty" in str(error).lower())
-            counts["premature"] += int("premature" in str(error).lower())
-            counts["invalid_frame"] += int(
-                "empty" not in str(error).lower() and "premature" not in str(error).lower()
-            )
-            continue
-        text = generated["response_text"]
-        terminated = generated["response_metadata"]["terminated_by_eos"]
-        counts["eos"] += int(terminated)
-        counts["truncated"] += int(not terminated and len(generated["token_ids"]) == maximum + 1)
-        dynamic_values = [
-            str(value["value"])
-            for value in frame["parameters"].values()
-            if isinstance(value, dict) and value.get("source") == "input_span"
-        ]
-        counts["consistent"] += int(
-            all(value.casefold() in text.casefold() for value in dynamic_values)
-        )
-    if not counts["samples"]:
-        raise ValueError("No generation evaluation batches")
-    total = counts["samples"]
-    return {
-        "response_eos_rate": counts["eos"] / total,
-        "response_empty_rate": counts["empty"] / total,
-        "response_truncation_rate": counts["truncated"] / total,
-        "response_semantic_consistency": counts["consistent"] / total,
-        "premature_success_claim_rate": counts["premature"] / total,
-        "invalid_frame_rate": counts["invalid_frame"] / total,
-    }
-
-
-def assemble_frame(prediction: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
-    act, goal = prediction["act"], prediction.get("goal")
-    if act not in config["labels"]["acts"]:
-        raise ValueError(f"Unknown ACT: {act}")
-    normalized_goal = goal or NONE
-    if normalized_goal not in config["labels"]["goal_masks_by_act"][act]:
-        raise ValueError(f"GOAL {normalized_goal} is incompatible with ACT {act}")
-    parameters = copy.deepcopy(prediction.get("parameters", {}))
-    specification = config["ontology"]["goal_parameters"].get(goal, {})
-    properties = specification.get("properties", {})
-    if not set(parameters) <= set(properties):
-        raise ValueError("Prediction contains parameters outside the GOAL schema")
-    missing = set(specification.get("required", [])) - set(parameters)
-    if missing:
-        raise ValueError(f"Prediction is missing required parameters: {sorted(missing)}")
-    for name, value in parameters.items():
-        parameter = properties[name]
-        if "enum" in parameter and value not in parameter["enum"]:
-            raise ValueError(f"Invalid value for {goal}.{name}: {value!r}")
-        if parameter.get("type") == "integer":
-            if not isinstance(value, int) or not parameter.get("minimum", value) <= value <= parameter.get("maximum", value):
-                raise ValueError(f"Invalid integer for {goal}.{name}: {value!r}")
-        if parameter.get("type") == "dynamic":
-            if not isinstance(value, dict) or value.get("source") not in {"input_span", "state_reference"}:
-                raise ValueError(f"Invalid dynamic value for {goal}.{name}")
-            if value["source"] == "input_span":
-                start, end, text = value.get("start"), value.get("end"), value.get("value")
-                if not isinstance(start, int) or not isinstance(end, int) or not isinstance(text, str) or start < 0 or end <= start:
-                    raise ValueError(f"Invalid input span for {goal}.{name}")
-            elif value.get("path") not in config["heads"]["references"].get(f"{goal}__{name}", []):
-                raise ValueError(f"Non-allowlisted state reference for {goal}.{name}")
-    return {
-        "schema_version": config["project"]["contract_version"],
-        "act": act,
-        "goal": goal,
-        "parameters": parameters,
-    }
 
 
 def train_epoch(
-    model: MultiTaskTransformer,
-    batches: Iterable[dict[str, Any]],
+    model: VoiceNativeSLU,
+    batches: Iterable[Mapping[str, Any]],
     optimizer: torch.optim.Optimizer,
-    config: dict[str, Any],
+    config: Mapping[str, Any],
     device: torch.device,
     scaler: torch.amp.GradScaler | None = None,
     epoch: int | None = None,
+    stage: TrainingStage | str = TrainingStage.JOINT,
 ) -> float:
+    """Train one epoch with the selected curriculum-stage loss set."""
+
     model.train()
+    selected = TrainingStage(stage)
+    enabled = set(config["training"]["stages"][selected.value]["enabled_losses"])
     accumulation = int(config["training"]["gradient_accumulation_steps"])
     clip_norm = float(config["training"]["gradient_clip_norm"])
     use_amp = device.type == "cuda" and config["training"]["precision"] == "fp16_mixed"
     scaler = scaler or torch.amp.GradScaler(device.type, enabled=use_amp)
-    total = count = pending = 0
     optimizer.zero_grad(set_to_none=True)
+    total = 0.0
+    count = 0
+    pending = 0
 
-    def step(micro_batches: int) -> None:
+    def optimizer_step(micro_batches: int) -> None:
         scaler.unscale_(optimizer)
         if micro_batches != accumulation:
             correction = accumulation / micro_batches
@@ -501,87 +329,312 @@ def train_epoch(
         scaler.update()
         optimizer.zero_grad(set_to_none=True)
 
-    progress = tqdm(
-        batches,
-        desc=f"Epoch {epoch}" if epoch is not None else "Train",
-        unit="batch",
-        dynamic_ncols=True,
-        leave=True,
-    )
-    for batch in progress:
-        tensors = _move_batch(batch, device)
+    progress = tqdm(batches, desc=f"{selected.value} {epoch}" if epoch is not None else selected.value, unit="batch")
+    for raw_batch in progress:
+        batch = _move_batch(raw_batch, device)
         with torch.amp.autocast(device_type=device.type, enabled=use_amp):
-            outputs = model(
-                tensors["input_ids"], tensors["input_mask"],
-                tensors["decoder_input_ids"], tensors["response_mask"],
-            )
-            loss, _ = compute_loss(outputs, tensors, config)
+            outputs = model(batch["waveform"], batch.get("audio_mask"))
+            loss, _ = compute_loss(outputs, batch, config, enabled)
         scaler.scale(loss / accumulation).backward()
         total += float(loss.detach())
         count += 1
-        progress.set_postfix(loss=f"{total / count:.4f}", refresh=False)
         pending += 1
+        progress.set_postfix(loss=f"{total / count:.4f}", refresh=False)
         if pending == accumulation:
-            step(pending)
+            optimizer_step(pending)
             pending = 0
     if pending:
-        step(pending)
+        optimizer_step(pending)
     if not count:
-        raise ValueError("No training batches")
+        raise ValueError("no training batches")
     return total / count
 
 
-def save_checkpoint(path: str | Path, state: dict[str, Any]) -> None:
+def _parameter_exact_match(
+    outputs: Mapping[str, Any], batch: Mapping[str, Any], schemas: Sequence[Mapping[str, Any]], config: Mapping[str, Any], row_index: int = 0
+) -> tuple[int, int]:
+    correct = total = 0
+    for row, target in enumerate(batch["target"]):
+        for operation_index, operation in enumerate(target.get("operations", [])):
+            goal = str(operation["goal"])
+            schema_index = _schema_index(schemas, goal)
+            for name, value in operation.get("parameters", {}).items():
+                head = outputs["parameter_outputs"][goal][name]
+                parameter = schemas[schema_index]["parameters"][name]
+                parameter_type = parameter["type"]
+                if parameter_type == "ENUM":
+                    predicted = parameter["values"][int(head["enum_logits"][row_index, operation_index].argmax())]
+                    is_correct = predicted == value
+                elif parameter_type == "NUMBER":
+                    predicted = float(head["number_value"][row_index, operation_index])
+                    is_correct = abs(predicted - float(value)) <= 1.0
+                elif parameter_type == "BOOLEAN":
+                    is_correct = bool(head["boolean_logits"][row_index, operation_index].argmax()) == value
+                elif parameter_type == "STATE_REFERENCE":
+                    reference_id = int(head["reference_logits"][row_index, operation_index].argmax())
+                    is_correct = parameter["state_reference_paths"][reference_id] == value["path"]
+                else:
+                    start = int(head["span_start_logits"][row_index, operation_index].argmax())
+                    end = int(head["span_end_logits"][row_index, operation_index].argmax())
+                    alignment = value.get("alignment", {}) if isinstance(value, Mapping) else {}
+                    frame_count = head["span_start_logits"].size(-1)
+                    expected_start = round(float(alignment.get("start", -1)) * (frame_count - 1))
+                    expected_end = round(float(alignment.get("end", -1)) * (frame_count - 1))
+                    is_correct = abs(start - expected_start) <= 1 and abs(end - expected_end) <= 1
+                total += 1
+                correct += int(is_correct)
+    return correct, total
+
+
+def validate_model(
+    model: VoiceNativeSLU,
+    batches: Iterable[Mapping[str, Any]],
+    config: Mapping[str, Any],
+    device: torch.device,
+    capability_schemas: Sequence[Mapping[str, Any]] | None = None,
+) -> dict[str, float]:
+    """Evaluate goal/action/parameter/frame and safety metrics."""
+
+    model.eval()
+    samples = act_correct = unsafe = operation_total = operation_correct = 0
+    goal_total = goal_correct = action_total = action_correct = frame_exact = 0
+    parameter_correct = parameter_total = 0
+    total_loss = 0.0
+    with torch.no_grad():
+        for raw_batch in batches:
+            batch = _move_batch(raw_batch, device)
+            outputs = model(batch["waveform"], batch.get("audio_mask"), capability_schemas=capability_schemas)
+            loss, _ = compute_loss(outputs, batch, config, set(config["training"]["loss_weights"]))
+            total_loss += float(loss) * len(batch["target"])
+            labels = _target_act_ids(batch, config, device)
+            predictions = outputs["act_logits"].argmax(-1)
+            samples += len(labels)
+            act_correct += int((predictions == labels).sum())
+            execute_id = config["ontology"]["acts"].index("EXECUTE")
+            unsafe += int(((predictions == execute_id) & (labels != execute_id)).sum())
+            gold_presence = _target_operation_presence(batch, int(config["operation_decoder"]["max_operations"]), device).bool()
+            predicted_presence = outputs["operation_presence_logits"].sigmoid() >= float(config["inference"]["operation_presence_threshold"])
+            operation_total += int(gold_presence.numel())
+            operation_correct += int((predicted_presence == gold_presence).sum())
+            schemas = _runtime_schemas(outputs)
+            # Per-row frame metrics use the runtime schema set and preserve
+            # operation ordering; no fixed ontology index is assumed.
+            # full frame validation is performed by assemble_frame below.
+            for row, target in enumerate(batch["target"]):
+                if not target.get("operations"):
+                    continue
+                all_correct = True
+                for operation_index, operation in enumerate(target["operations"]):
+                    schema_index = _schema_index(schemas, operation["goal"])
+                    predicted_goal = schemas[int(outputs["goal_scores"][row, operation_index].argmax())]["name"]
+                    predicted_action = schemas[schema_index]["actions"][int(outputs["action_scores"][schema_index][row, operation_index].argmax())]
+                    goal_correct += int(predicted_goal == operation["goal"])
+                    action_correct += int(predicted_action == operation["action"])
+                    goal_total += 1
+                    action_total += 1
+                    all_correct = all_correct and predicted_goal == operation["goal"] and predicted_action == operation["action"]
+                correct, total = _parameter_exact_match(outputs, {"target": [target]}, schemas, config, row_index=row)
+                parameter_correct += correct
+                parameter_total += total
+                frame_exact += int(all_correct and correct == total)
+    if not samples:
+        raise ValueError("no validation batches")
+    return {
+        "validation_loss": total_loss / samples,
+        "act_accuracy": act_correct / samples,
+        "goal_retrieval_accuracy": goal_correct / max(goal_total, 1),
+        "action_accuracy": action_correct / max(action_total, 1),
+        "parameter_accuracy": parameter_correct / max(parameter_total, 1),
+        "semantic_frame_exact_accuracy": frame_exact / max(samples, 1),
+        "operation_presence_accuracy": operation_correct / max(operation_total, 1),
+        "unsafe_false_execute_rate": unsafe / max(samples, 1),
+    }
+
+
+def predict(
+    model: VoiceNativeSLU,
+    waveform: Tensor,
+    config: Mapping[str, Any],
+    audio_mask: Tensor | None = None,
+    capability_schemas: Sequence[Mapping[str, Any]] | None = None,
+    capability_embeddings: Tensor | None = None,
+) -> dict[str, Any]:
+    """Produce an untrusted semantic prediction from one waveform."""
+
+    if waveform.dim() == 1:
+        waveform = waveform.unsqueeze(0)
+    if waveform.dim() != 2 or waveform.size(0) != 1:
+        raise ValueError("predict accepts one waveform with shape [samples] or [1, samples]")
+    if audio_mask is not None and audio_mask.dim() == 1:
+        audio_mask = audio_mask.unsqueeze(0)
+    model.eval()
+    with torch.no_grad():
+        outputs = model(waveform, audio_mask, capability_schemas, capability_embeddings)
+    acts = config["ontology"]["acts"]
+    act_probabilities = outputs["act_logits"].softmax(-1)[0]
+    act_id = int(act_probabilities.argmax())
+    act = acts[act_id]
+    act_confidence = float(act_probabilities[act_id])
+    ood_score = float(outputs["ood_logit"].sigmoid()[0])
+    base_confidence = {"act": act_confidence, "goal": 0.0, "parameters": 0.0, "ood": ood_score, "overall": 0.0}
+    if act_confidence < float(config["inference"]["act_min_confidence"]) or ood_score > float(config["inference"]["max_ood_score"]):
+        return {"act": "UNSUPPORTED", "operations": [], "confidence": base_confidence}
+
+    schemas = outputs["capability_schemas"]
+    schema_names = outputs["schema_names"]
+    presence = outputs["operation_presence_logits"].sigmoid()[0]
+    confidence_values = outputs["confidence_logits"].sigmoid()[0]
+    operations: list[dict[str, Any]] = []
+    for operation_index in range(outputs["operation_queries"].size(1)):
+        if float(presence[operation_index]) < float(config["inference"]["operation_presence_threshold"]):
+            continue
+        goal_scores = outputs["goal_scores"][0, operation_index].softmax(-1)
+        goal_id = int(goal_scores.argmax())
+        goal_confidence = float(goal_scores[goal_id])
+        if goal_confidence < float(config["inference"]["goal_min_confidence"]):
+            return {"act": "ASK_CLARIFICATION", "operations": [], "confidence": {**base_confidence, "goal": goal_confidence}}
+        goal = schema_names[goal_id]
+        schema = schemas[goal_id]
+        action_scores = outputs["action_scores"][goal_id][0, operation_index].softmax(-1)
+        action_id = int(action_scores.argmax())
+        action_confidence = float(action_scores[action_id])
+        if action_confidence < float(config["inference"]["action_min_confidence"]):
+            return {"act": "ASK_CLARIFICATION", "operations": [], "confidence": {**base_confidence, "goal": goal_confidence}}
+        action = schema["actions"][action_id]
+        parameters: dict[str, Any] = {}
+        parameter_confidence = 1.0
+        for name, parameter_schema in schema.get("parameters", {}).items():
+            head = outputs["parameter_outputs"][goal][name]
+            present_probability = float(head["presence_logits"][0, operation_index].softmax(-1)[1])
+            if present_probability < float(config["inference"]["parameter_min_confidence"]):
+                if parameter_schema.get("required"):
+                    return {"act": "ASK_CLARIFICATION", "operations": [], "confidence": {**base_confidence, "goal": goal_confidence, "parameters": present_probability}}
+                continue
+            parameter_confidence = min(parameter_confidence, present_probability)
+            parameter_type = parameter_schema["type"]
+            if parameter_type == "ENUM":
+                parameters[name] = parameter_schema["values"][int(head["enum_logits"][0, operation_index].argmax())]
+            elif parameter_type == "NUMBER":
+                value = float(head["number_value"][0, operation_index])
+                value = max(float(parameter_schema.get("minimum", value)), min(float(parameter_schema.get("maximum", value)), value))
+                parameters[name] = int(round(value)) if value.is_integer() else value
+            elif parameter_type == "BOOLEAN":
+                parameters[name] = bool(head["boolean_logits"][0, operation_index].argmax())
+            elif parameter_type == "STATE_REFERENCE":
+                reference_id = int(head["reference_logits"][0, operation_index].argmax())
+                parameters[name] = {"source": "state_reference", "path": parameter_schema["state_reference_paths"][reference_id]}
+            else:
+                start = int(head["span_start_logits"][0, operation_index].argmax())
+                end = int(head["span_end_logits"][0, operation_index].argmax())
+                frame_count = head["span_start_logits"].size(-1)
+                parameters[name] = {
+                    "source": "input_span",
+                    "start_frame": start,
+                    "end_frame": max(start, end),
+                    "start_ratio": start / max(frame_count - 1, 1),
+                    "end_ratio": (max(start, end) + 1) / max(frame_count, 1),
+                }
+        operations.append({"order": operation_index + 1, "goal": goal, "action": action, "parameters": parameters, "confidence": min(goal_confidence, action_confidence)})
+
+    if act == "EXECUTE" and not operations:
+        return {"act": "ASK_CLARIFICATION", "operations": [], "confidence": {**base_confidence}}
+    overall = min(act_confidence, float(confidence_values.min()), 1.0 - ood_score)
+    return {
+        "act": act,
+        "operations": operations,
+        "confidence": {
+            "act": act_confidence,
+            "goal": min((operation["confidence"] for operation in operations), default=1.0),
+            "parameters": float(confidence_values[2]),
+            "ood": ood_score,
+            "overall": overall,
+        },
+    }
+
+
+def assemble_frame(
+    prediction: Mapping[str, Any],
+    config: Mapping[str, Any],
+    *,
+    request_id: str | None = None,
+    model_version: str | None = None,
+) -> dict[str, Any]:
+    """Validate and serialize the V0 Semantic Execution Frame."""
+
+    validate_config(config)
+    frame = copy.deepcopy(dict(prediction))
+    confidence = frame.get("confidence")
+    if not isinstance(confidence, Mapping):
+        raise DatasetContractError("confidence is required")
+    for key, value in confidence.items():
+        if not isinstance(value, (int, float)) or not 0 <= float(value) <= 1:
+            raise DatasetContractError(f"confidence.{key} must be in [0,1]")
+    validate_target({"act": frame.get("act"), "operations": frame.get("operations", [])}, config)
+    if float(confidence.get("ood", 1.0)) > float(config["inference"]["max_ood_score"]):
+        raise DatasetContractError("prediction is out of distribution")
+    if float(confidence.get("overall", 0.0)) < float(config["inference"]["act_min_confidence"]):
+        raise DatasetContractError("prediction confidence is below execution threshold")
+    return {
+        "model_version": model_version or config["project"]["architecture"],
+        "request_id": request_id,
+        "act": frame["act"],
+        "operations": frame.get("operations", []),
+        "confidence": dict(confidence),
+    }
+
+
+def save_checkpoint(path: str | Path, state: Mapping[str, Any]) -> None:
     destination = Path(path)
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary = destination.with_suffix(destination.suffix + ".tmp")
     try:
-        torch.save(state, temporary)
+        torch.save(dict(state), temporary)
         temporary.replace(destination)
     finally:
         temporary.unlink(missing_ok=True)
 
 
-def export_package(
-    path: str | Path,
-    model: MultiTaskTransformer,
-    tokenizer: Tokenizer,
-    config: dict[str, Any],
-) -> None:
+def export_package(path: str | Path, model: VoiceNativeSLU, config: Mapping[str, Any]) -> None:
+    """Export model, validated JSON config and the lexical vocabulary artifact."""
+
     validate_config(config)
     destination = Path(path)
     destination.mkdir(parents=True, exist_ok=True)
-    expected = {"model.safetensors", "config.json", "tokenizer.json", "requirements.txt"}
-    extra_directories = [child.name for child in destination.iterdir() if child.is_dir()]
-    if extra_directories:
-        raise ValueError(f"Package destination contains directories: {extra_directories}")
+    expected = {"model.safetensors", "config.json", "lexical_vocab.json", "requirements.txt"}
     for child in destination.iterdir():
+        if child.is_dir():
+            raise ValueError(f"package destination contains directory: {child.name}")
         if child.name not in expected:
             child.unlink()
     save_safetensors(model, str(destination / "model.safetensors"))
-    (destination / "config.json").write_text(
-        json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
-    tokenizer.save(str(destination / "tokenizer.json"))
-    (destination / "requirements.txt").write_text(
-        "torch\ntokenizers\nsafetensors\ntqdm\n", encoding="utf-8"
-    )
+    (destination / "config.json").write_text(json.dumps(config, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    (destination / "lexical_vocab.json").write_text(json.dumps(config["lexical_branch"]["vocab"], ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    (destination / "requirements.txt").write_text("torch\nsafetensors\ntqdm\n", encoding="utf-8")
 
 
-def load_package(
-    path: str | Path, device: torch.device
-) -> tuple[MultiTaskTransformer, Tokenizer, dict[str, Any]]:
+def load_package(path: str | Path, device: torch.device) -> tuple[VoiceNativeSLU, dict[str, Any]]:
     source = Path(path)
-    expected = {"model.safetensors", "config.json", "tokenizer.json", "requirements.txt"}
+    expected = {"model.safetensors", "config.json", "lexical_vocab.json", "requirements.txt"}
     entries = list(source.iterdir())
     if {child.name for child in entries} != expected or not all(child.is_file() for child in entries):
-        raise ValueError("Package must contain exactly four regular files")
+        raise ValueError("V0 package must contain exactly four regular files")
     config = json.loads((source / "config.json").read_text(encoding="utf-8"))
+    lexical_vocab = json.loads((source / "lexical_vocab.json").read_text(encoding="utf-8"))
+    if lexical_vocab != config["lexical_branch"]["vocab"]:
+        raise ValueError("lexical vocabulary artifact does not match config")
     validate_config(config)
-    tokenizer = Tokenizer.from_file(str(source / "tokenizer.json"))
-    if tokenizer.get_vocab_size() != config["tokenizer"]["vocab_size"]:
-        raise ValueError("Tokenizer vocabulary does not match config")
     model = build_model(config).to(device)
     load_safetensors(model, str(source / "model.safetensors"), device=str(device))
     model.eval()
-    return model, tokenizer, config
+    return model, config
+
+
+def generate_response(*_args: Any, **_kwargs: Any) -> None:
+    raise RuntimeError("VALLS SLU V0 has no neural response decoder; use the template Response Module after Grounded Result")
+
+
+def evaluate_generation(*_args: Any, **_kwargs: Any) -> None:
+    raise RuntimeError("VALLS SLU V0 evaluates semantic frames, not neural response generation")
+
+
+MultiTaskTransformer = VoiceNativeSLU
