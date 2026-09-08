@@ -1,21 +1,22 @@
 """Dataset boundaries for the voice-native VALLS SLU V0 model.
 
-The repository does not contain the V0 dataset yet.  This module therefore
-provides strict record validation and a small audio dataset adapter, without
-inventing a missing corpus format or response-generation targets.
+The V0 corpus is waveform-first.  Transcript text is not the semantic input,
+but it is required for ENTITY/FREE_TEXT lexical supervision.  Span targets use
+normalized speech-frame ratios produced by a forced aligner, so they remain
+valid after batching and convolutional subsampling.
 """
 
 from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any, Callable, Iterable, Sequence
+from typing import Any, Callable, Sequence
 
 import torch
 from torch import Tensor
 from torch.utils.data import Dataset
 
-from .config import PARAMETER_TYPES, validate_config
+from .config import default_lexical_vocab, validate_config
 
 
 class DatasetContractError(ValueError):
@@ -27,8 +28,6 @@ def canonical_json(value: Any) -> str:
 
 
 def load_jsonl(path: str | Path) -> list[dict[str, Any]]:
-    """Load non-empty JSONL records without silently skipping malformed rows."""
-
     source = Path(path)
     records: list[dict[str, Any]] = []
     for line_number, line in enumerate(source.read_text(encoding="utf-8").splitlines(), 1):
@@ -44,12 +43,78 @@ def load_jsonl(path: str | Path) -> list[dict[str, Any]]:
     return records
 
 
-def _validate_parameter(
-    goal: str,
-    name: str,
-    value: Any,
-    schema: dict[str, Any],
-) -> None:
+def encode_lexical_text(text: str, vocab: Sequence[str] | None = None) -> list[int]:
+    """Encode UTF-8 bytes as ids 1..256; id 0 is the CTC blank."""
+
+    active_vocab = list(vocab or default_lexical_vocab())
+    if len(active_vocab) < 257 or active_vocab[0] != "<BLANK>":
+        raise DatasetContractError("lexical vocabulary must contain blank plus 256 byte tokens")
+    return [byte + 1 for byte in text.encode("utf-8")]
+
+
+def decode_lexical_ids(ids: Sequence[int], vocab: Sequence[str] | None = None) -> str:
+    """Decode greedy lexical ids, ignoring CTC blank and repeated ids."""
+
+    active_vocab = list(vocab or default_lexical_vocab())
+    if len(active_vocab) < 257:
+        raise DatasetContractError("lexical vocabulary is incomplete")
+    bytes_out: list[int] = []
+    previous = None
+    for index in ids:
+        index = int(index)
+        if index == 0 or index == previous:
+            previous = index
+            continue
+        if not 1 <= index <= 256:
+            raise DatasetContractError(f"invalid lexical token id: {index}")
+        bytes_out.append(index - 1)
+        previous = index
+    return bytes(bytes_out).decode("utf-8", errors="replace")
+
+
+def _validate_alignment(value: dict[str, Any]) -> None:
+    alignment = value.get("alignment")
+    if not isinstance(alignment, dict):
+        raise DatasetContractError("input_span requires alignment={start,end} ratios")
+    start, end = alignment.get("start"), alignment.get("end")
+    if (
+        isinstance(start, bool)
+        or not isinstance(start, (int, float))
+        or isinstance(end, bool)
+        or not isinstance(end, (int, float))
+        or not 0 <= float(start) < float(end) <= 1
+    ):
+        raise DatasetContractError("alignment ratios must satisfy 0 <= start < end <= 1")
+
+
+def _validate_input_span(value: dict[str, Any], transcript: str | None) -> None:
+    # Inference frames use speech-frame ratios; supervised records additionally
+    # carry transcript character offsets for lexical/span alignment.
+    if transcript is None and "start_frame" in value:
+        _validate_alignment({"alignment": {"start": value.get("start_ratio"), "end": value.get("end_ratio")}})
+        if not isinstance(value.get("start_frame"), int) or not isinstance(value.get("end_frame"), int):
+            raise DatasetContractError("predicted input_span requires integer frame bounds")
+        return
+    start, end, text = value.get("start"), value.get("end"), value.get("value")
+    if (
+        isinstance(start, bool)
+        or not isinstance(start, int)
+        or isinstance(end, bool)
+        or not isinstance(end, int)
+        or start < 0
+        or end <= start
+        or not isinstance(text, str)
+        or not text
+    ):
+        raise DatasetContractError("input_span requires start, end and non-empty value")
+    if transcript is None:
+        raise DatasetContractError("input_span requires transcript")
+    if text != transcript[start:end]:
+        raise DatasetContractError("input_span value must equal transcript[start:end]")
+    _validate_alignment(value)
+
+
+def _validate_parameter(goal: str, name: str, value: Any, schema: dict[str, Any], transcript: str | None) -> None:
     parameter_type = schema["type"]
     if parameter_type == "ENUM":
         if value not in schema["values"]:
@@ -67,7 +132,7 @@ def _validate_parameter(
     elif parameter_type in {"ENTITY", "FREE_TEXT"}:
         if not isinstance(value, dict) or value.get("source") != "input_span":
             raise DatasetContractError(f"{goal}.{name} must use an input_span value")
-        _validate_input_span(value)
+        _validate_input_span(value, transcript)
     elif parameter_type == "STATE_REFERENCE":
         if not isinstance(value, dict) or value.get("source") != "state_reference":
             raise DatasetContractError(f"{goal}.{name} must use a state_reference value")
@@ -75,24 +140,19 @@ def _validate_parameter(
             raise DatasetContractError(f"state reference is not allowlisted for {goal}.{name}")
 
 
-def _validate_input_span(value: dict[str, Any]) -> None:
-    start, end, text = value.get("start"), value.get("end"), value.get("value")
-    if (
-        isinstance(start, bool)
-        or not isinstance(start, int)
-        or isinstance(end, bool)
-        or not isinstance(end, int)
-        or start < 0
-        or end <= start
-        or not isinstance(text, str)
-        or not text
-    ):
-        raise DatasetContractError("input_span requires start, end and non-empty value")
+def _requires_transcript(target: dict[str, Any], config: dict[str, Any]) -> bool:
+    for operation in target.get("operations", []):
+        goal = operation.get("goal")
+        if goal not in config["ontology"]["capabilities"]:
+            continue
+        schemas = config["ontology"]["capabilities"][goal]["parameters"]
+        for name, value in operation.get("parameters", {}).items():
+            if schemas.get(name, {}).get("type") in {"ENTITY", "FREE_TEXT"} and isinstance(value, dict) and value.get("source") == "input_span":
+                return True
+    return False
 
 
-def validate_target(target: dict[str, Any], config: dict[str, Any]) -> None:
-    """Validate one untrusted semantic target against capability schemas."""
-
+def validate_target(target: dict[str, Any], config: dict[str, Any], transcript: str | None = None) -> None:
     acts = config["ontology"]["acts"]
     if target.get("act") not in acts:
         raise DatasetContractError(f"unknown ACT: {target.get('act')!r}")
@@ -112,6 +172,9 @@ def validate_target(target: dict[str, Any], config: dict[str, Any]) -> None:
         if goal not in config["ontology"]["capabilities"]:
             raise DatasetContractError(f"unknown capability schema: {goal!r}")
         schema = config["ontology"]["capabilities"][goal]
+        action = operation.get("action")
+        if action not in schema.get("actions", []):
+            raise DatasetContractError(f"invalid action for {goal}: {action!r}")
         parameters = operation.get("parameters", {})
         if not isinstance(parameters, dict):
             raise DatasetContractError("operation.parameters must be an object")
@@ -120,12 +183,11 @@ def validate_target(target: dict[str, Any], config: dict[str, Any]) -> None:
         if extra:
             raise DatasetContractError(f"unknown parameters for {goal}: {sorted(extra)}")
         for name, parameter_schema in parameter_schemas.items():
-            required = bool(parameter_schema.get("required", False))
             if name not in parameters:
-                if required:
+                if parameter_schema.get("required"):
                     raise DatasetContractError(f"missing required parameter {goal}.{name}")
                 continue
-            _validate_parameter(goal, name, parameters[name], parameter_schema)
+            _validate_parameter(goal, name, parameters[name], parameter_schema, transcript)
 
     if target["act"] == "EXECUTE" and not operations:
         raise DatasetContractError("EXECUTE requires at least one operation")
@@ -134,8 +196,6 @@ def validate_target(target: dict[str, Any], config: dict[str, Any]) -> None:
 
 
 def validate_record(record: dict[str, Any], config: dict[str, Any]) -> None:
-    """Validate the V0 record envelope without assuming a physical audio format."""
-
     required = {"sample_id", "audio", "target"}
     missing = required - set(record)
     if missing:
@@ -151,28 +211,25 @@ def validate_record(record: dict[str, Any], config: dict[str, Any]) -> None:
         raise DatasetContractError("audio sequence must contain at least two samples")
     if not isinstance(record["target"], dict):
         raise DatasetContractError("target must be an object")
-    validate_target(record["target"], config)
+    transcript = record.get("transcript")
+    if transcript is not None and not isinstance(transcript, str):
+        raise DatasetContractError("transcript must be a string when provided")
+    if _requires_transcript(record["target"], config) and not transcript:
+        raise DatasetContractError("transcript is required for ENTITY/FREE_TEXT input spans")
+    validate_target(record["target"], config, transcript)
 
 
 class VoiceSLUDataset(Dataset[dict[str, Any]]):
-    """Minimal dataset adapter for future waveform-backed V0 records.
+    """Waveform dataset adapter with transcript and lexical supervision."""
 
-    ``audio_loader`` is injected because the source dataset and storage format
-    are intentionally not part of the current architecture contract.
-    """
-
-    def __init__(
-        self,
-        records: Sequence[dict[str, Any]],
-        config: dict[str, Any],
-        audio_loader: Callable[[Any], Tensor] | None = None,
-    ) -> None:
+    def __init__(self, records: Sequence[dict[str, Any]], config: dict[str, Any], audio_loader: Callable[[Any], Tensor] | None = None) -> None:
         validate_config(config)
         for record in records:
             validate_record(record, config)
         self.records = list(records)
         self.config = config
         self.audio_loader = audio_loader or self._default_audio_loader
+        self.lexical_vocab = config["lexical_branch"]["vocab"]
 
     @staticmethod
     def _default_audio_loader(audio: Any) -> Tensor:
@@ -181,9 +238,7 @@ class VoiceSLUDataset(Dataset[dict[str, Any]]):
         elif isinstance(audio, (list, tuple)):
             waveform = torch.tensor(audio, dtype=torch.float32)
         else:
-            raise DatasetContractError(
-                "an audio_loader is required for path-based audio records"
-            )
+            raise DatasetContractError("an audio_loader is required for path-based audio records")
         if waveform.dim() != 1 or waveform.numel() < 2:
             raise DatasetContractError("loaded waveform must have shape [samples]")
         return waveform
@@ -194,19 +249,20 @@ class VoiceSLUDataset(Dataset[dict[str, Any]]):
     def __getitem__(self, index: int) -> dict[str, Any]:
         record = self.records[index]
         waveform = self.audio_loader(record["audio"])
-        if waveform.dim() != 1 or waveform.numel() < 2:
-            raise DatasetContractError("audio_loader returned an invalid waveform")
+        transcript = record.get("transcript")
+        lexical_ids = encode_lexical_text(transcript or "", self.lexical_vocab)
         return {
             "sample_id": record["sample_id"],
             "waveform": waveform,
             "target": record["target"],
+            "transcript": transcript,
+            "lexical_labels": torch.tensor(lexical_ids, dtype=torch.long),
+            "lexical_input_length": None,
             "metadata": record.get("metadata", {}),
         }
 
 
 def collate_audio_batch(items: Sequence[dict[str, Any]]) -> dict[str, Any]:
-    """Pad waveform records and retain targets for training-time encoding."""
-
     if not items:
         raise ValueError("cannot collate an empty batch")
     lengths = [int(item["waveform"].numel()) for item in items]
@@ -217,16 +273,18 @@ def collate_audio_batch(items: Sequence[dict[str, Any]]) -> dict[str, Any]:
         values = item["waveform"].float()
         waveform[row, : values.numel()] = values
         audio_mask[row, : values.numel()] = True
+    labels = [item["lexical_labels"] for item in items]
     return {
         "waveform": waveform,
         "audio_mask": audio_mask,
         "sample_id": [item["sample_id"] for item in items],
         "target": [item["target"] for item in items],
+        "transcript": [item["transcript"] for item in items],
+        "lexical_labels": torch.cat(labels) if any(label.numel() for label in labels) else torch.empty(0, dtype=torch.long),
+        "lexical_target_lengths": torch.tensor([label.numel() for label in labels], dtype=torch.long),
         "metadata": [item["metadata"] for item in items],
     }
 
 
-# Compatibility names are intentionally descriptive aliases for the new
-# waveform dataset; no legacy text/response targets are reintroduced.
 MultiTaskDataset = VoiceSLUDataset
 collate_batch = collate_audio_batch
