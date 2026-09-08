@@ -138,9 +138,16 @@ def _validate_parameter(goal: str, name: str, value: Any, schema: dict[str, Any]
         if not isinstance(value, bool):
             raise DatasetContractError(f"{goal}.{name} must be boolean")
     elif parameter_type in {"ENTITY", "FREE_TEXT"}:
-        if not isinstance(value, dict) or value.get("source") != "input_span":
-            raise DatasetContractError(f"{goal}.{name} must use an input_span value")
-        _validate_input_span(value, transcript)
+        if not isinstance(value, dict):
+            raise DatasetContractError(f"{goal}.{name} must be a typed value")
+        source = value.get("source")
+        if source == "input_span":
+            _validate_input_span(value, transcript)
+        elif source == "state_reference":
+            if value.get("path") not in schema.get("state_reference_paths", []):
+                raise DatasetContractError(f"state reference is not allowlisted for {goal}.{name}")
+        else:
+            raise DatasetContractError(f"unsupported source for {goal}.{name}: {source!r}")
     elif parameter_type == "STATE_REFERENCE":
         if not isinstance(value, dict) or value.get("source") != "state_reference":
             raise DatasetContractError(f"{goal}.{name} must use a state_reference value")

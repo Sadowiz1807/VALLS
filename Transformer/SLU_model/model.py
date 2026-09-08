@@ -601,7 +601,7 @@ class BooleanExtractor(nn.Module):
 
 
 class SpanExtractor(nn.Module):
-    SOURCES = ["ABSENT", "INPUT_SPAN", "STATE_REFERENCE"]
+    SOURCES = ["INPUT_SPAN", "STATE_REFERENCE"]
 
     def __init__(self, schema_encoder: SchemaTextEncoder, d_model: int) -> None:
         super().__init__()
@@ -619,8 +619,11 @@ class SpanExtractor(nn.Module):
     ) -> dict[str, Tensor]:
         query = self.span_query(conditioned)
         keys = self.span_key(span_states)
+        source_logits = self.source_head(conditioned)
+        if not reference_paths:
+            source_logits[..., self.SOURCES.index("STATE_REFERENCE")] = torch.finfo(source_logits.dtype).min
         result: dict[str, Tensor] = {
-            "source_logits": self.source_head(conditioned),
+            "source_logits": source_logits,
             "span_start_logits": torch.einsum("bod,btd->bot", query, keys),
             "span_end_logits": torch.einsum("bod,btd->bot", query, keys),
         }
@@ -820,6 +823,7 @@ class VoiceNativeSLU(nn.Module):
         audio_mask: Tensor | None = None,
         capability_schemas: Sequence[Mapping[str, Any]] | None = None,
         capability_embeddings: Tensor | None = None,
+        bridge_only: bool = False,
     ) -> dict[str, Any]:
         schemas = self.default_schemas() if capability_schemas is None else [dict(schema) for schema in capability_schemas]
         if not schemas:
@@ -827,6 +831,18 @@ class VoiceNativeSLU(nn.Module):
         for schema in schemas:
             if "name" not in schema:
                 raise ValueError("every capability schema requires a name")
+        if bridge_only:
+            # BRIDGE stops at the resampler. Do not even execute SemanticCore:
+            # it is an untrained/frozen semantic transformation at this stage.
+            speech_states, speech_mask = self.speech_encoder(waveform, audio_mask)
+            semantic_latents, semantic_mask = self.semantic_resampler(speech_states, speech_mask)
+            return {
+                "speech_states": speech_states,
+                "speech_mask": speech_mask,
+                "semantic_latents": semantic_latents,
+                "semantic_mask": semantic_mask,
+                "bridge_states": self.bridge_alignment_head(semantic_latents),
+            }
         encoded = self.encode_audio(waveform, audio_mask)
         semantic_states = encoded["semantic_states"]
         semantic_mask = encoded["semantic_mask"]
@@ -845,14 +861,14 @@ class VoiceNativeSLU(nn.Module):
             "goal_scores": self.schema_retriever(operation_queries, schemas, capability_embeddings),
             "action_scores": self.action_resolver(operation_queries, schemas),
             "parameter_outputs": self.parameter_extractor(operation_queries, encoded["speech_states"], schemas),
-            "bridge_states": self.bridge_alignment_head(semantic_states),
+            "bridge_states": self.bridge_alignment_head(encoded["semantic_latents"]),
         }
         if self.lexical_head is not None:
             # CTC stays on acoustic states for ACOUSTIC.  BRIDGE uses the
             # bridge_states output and an explicit representation-alignment
             # objective so the resampler receives a linguistic preservation signal.
             outputs["lexical_ctc_logits"] = self.lexical_head(encoded["speech_states"])
-            outputs["bridge_lexical_logits"] = self.lexical_head(encoded["semantic_states"])
+            outputs["bridge_lexical_logits"] = self.lexical_head(encoded["semantic_latents"])
         return outputs
 
 
