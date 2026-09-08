@@ -311,10 +311,12 @@ def compute_loss(
             raise DatasetContractError("bridge_alignment requires bridge_only model outputs")
         speech = F.normalize(outputs["speech_states"], dim=-1)
         speech_mask = outputs["speech_mask"].to(speech.dtype).unsqueeze(-1)
-        speech_summary = (speech * speech_mask).sum(1) / speech_mask.sum(1).clamp_min(1.0)
-        bridge = F.normalize(outputs["bridge_states"], dim=-1)
-        speech_summary = speech_summary.unsqueeze(1).expand_as(bridge)
-        losses["bridge_alignment"] = 1.0 - (bridge * speech_summary).sum(-1).mean()
+        speech_summary = (speech * speech_mask).sum(dim=1) / speech_mask.sum(dim=1).clamp_min(1.0)
+        speech_summary = F.normalize(speech_summary.detach(), dim=-1)
+        bridge_summary = F.normalize(outputs["bridge_states"].mean(dim=1), dim=-1)
+        losses["bridge_alignment"] = (
+            1.0 - F.cosine_similarity(bridge_summary, speech_summary, dim=-1).mean()
+        )
     if "lexical" in enabled:
         if int(batch.get("ctc_invalid_count", 0)) > 0:
             raise DatasetContractError(
@@ -468,50 +470,68 @@ def train_epoch(
 
 
 def _parameter_exact_match(
-    outputs: Mapping[str, Any], batch: Mapping[str, Any], schemas: Sequence[Mapping[str, Any]], config: Mapping[str, Any], row_index: int = 0
-) -> tuple[int, int]:
+    outputs: Mapping[str, Any],
+    batch: Mapping[str, Any],
+    schemas: Sequence[Mapping[str, Any]],
+    config: Mapping[str, Any],
+    row_index: int = 0,
+) -> tuple[int, int, bool, int, int]:
+    """Compare every schema parameter, including optional presence and extras."""
+
     correct = total = 0
-    for row, target in enumerate(batch["target"]):
-        for operation_index, operation in enumerate(target.get("operations", [])):
-            goal = str(operation["goal"])
-            schema_index = _schema_index(schemas, goal)
-            for name, value in operation.get("parameters", {}).items():
-                head = outputs["parameter_outputs"][goal][name]
-                parameter = schemas[schema_index]["parameters"][name]
+    presence_correct = presence_total = 0
+    frame_correct = True
+    target = batch["target"][0]
+    for operation_index, operation in enumerate(target.get("operations", [])):
+        goal = str(operation["goal"])
+        schema_index = _schema_index(schemas, goal)
+        gold_parameters = operation.get("parameters", {})
+        for name, parameter in schemas[schema_index].get("parameters", {}).items():
+            head = outputs["parameter_outputs"][goal][name]
+            gold_present = name in gold_parameters
+            predicted_present = int(head["presence_logits"][row_index, operation_index].argmax()) == 1
+            parameter_correct = gold_present == predicted_present
+            presence_correct += int(parameter_correct)
+            presence_total += 1
+            if gold_present and predicted_present:
+                value = gold_parameters[name]
                 parameter_type = parameter["type"]
                 if parameter_type == "ENUM":
                     predicted = parameter["values"][int(head["enum_logits"][row_index, operation_index].argmax())]
-                    is_correct = predicted == value
+                    parameter_correct = predicted == value
                 elif parameter_type == "NUMBER":
                     predicted = float(head["number_value"][row_index, operation_index])
-                    is_correct = abs(predicted - float(value)) <= 1.0
+                    parameter_correct = abs(predicted - float(value)) <= 1.0
                 elif parameter_type == "BOOLEAN":
-                    is_correct = bool(head["boolean_logits"][row_index, operation_index].argmax()) == value
+                    parameter_correct = bool(head["boolean_logits"][row_index, operation_index].argmax()) == value
                 elif parameter_type == "STATE_REFERENCE":
                     reference_id = int(head["reference_logits"][row_index, operation_index].argmax())
-                    is_correct = parameter["state_reference_paths"][reference_id] == value["path"]
+                    parameter_correct = parameter["state_reference_paths"][reference_id] == value["path"]
                 elif parameter_type in {"ENTITY", "FREE_TEXT"}:
                     source = value.get("source") if isinstance(value, Mapping) else None
                     source_id = int(head["source_logits"][row_index, operation_index].argmax())
                     if source == "state_reference":
-                        is_correct = (
+                        parameter_correct = (
                             source_id == SpanExtractor.SOURCES.index("STATE_REFERENCE")
                             and "reference_logits" in head
                             and parameter["state_reference_paths"][int(head["reference_logits"][row_index, operation_index].argmax())] == value["path"]
                         )
-                    else:
+                    elif source == "input_span":
                         start = int(head["span_start_logits"][row_index, operation_index].argmax())
                         end = int(head["span_end_logits"][row_index, operation_index].argmax())
-                        alignment = value.get("alignment", {}) if isinstance(value, Mapping) else {}
+                        alignment = value.get("alignment", {})
                         frame_count = head["span_start_logits"].size(-1)
                         expected_start = round(float(alignment.get("start", -1)) * (frame_count - 1))
                         expected_end = round(float(alignment.get("end", -1)) * (frame_count - 1))
-                        is_correct = source_id == SpanExtractor.SOURCES.index("INPUT_SPAN") and abs(start - expected_start) <= 1 and abs(end - expected_end) <= 1
+                        parameter_correct = source_id == SpanExtractor.SOURCES.index("INPUT_SPAN") and abs(start - expected_start) <= 1 and abs(end - expected_end) <= 1
+                    else:
+                        parameter_correct = False
                 else:
-                    is_correct = False
-                total += 1
-                correct += int(is_correct)
-    return correct, total
+                    parameter_correct = False
+            correct += int(parameter_correct)
+            total += 1
+            frame_correct = frame_correct and parameter_correct
+    return correct, total, frame_correct, presence_correct, presence_total
 
 
 def validate_model(
@@ -527,6 +547,8 @@ def validate_model(
     samples = act_correct = unsafe = operation_total = operation_correct = 0
     goal_total = goal_correct = action_total = action_correct = frame_exact = 0
     parameter_correct = parameter_total = 0
+    parameter_presence_correct = parameter_presence_total = 0
+    operation_count_correct = 0
     total_loss = 0.0
     ctc_invalid_count = 0
     ctc_sample_count = 0
@@ -557,6 +579,7 @@ def validate_model(
                 gold_count = len(target.get("operations", []))
                 predicted_count = int(predicted_presence[row].sum().item())
                 all_correct = all_correct and predicted_count == gold_count
+                operation_count_correct += int(predicted_count == gold_count)
                 if not target.get("operations"):
                     frame_exact += int(all_correct)
                     continue
@@ -569,10 +592,12 @@ def validate_model(
                     goal_total += 1
                     action_total += 1
                     all_correct = all_correct and predicted_goal == operation["goal"] and predicted_action == operation["action"]
-                correct, total = _parameter_exact_match(outputs, {"target": [target]}, schemas, config, row_index=row)
+                correct, total, parameters_exact, presence_correct, presence_total = _parameter_exact_match(outputs, {"target": [target]}, schemas, config, row_index=row)
                 parameter_correct += correct
                 parameter_total += total
-                frame_exact += int(all_correct and correct == total)
+                parameter_presence_correct += presence_correct
+                parameter_presence_total += presence_total
+                frame_exact += int(all_correct and parameters_exact)
     if not samples:
         raise ValueError("no validation batches")
     return {
@@ -582,6 +607,8 @@ def validate_model(
         "goal_retrieval_accuracy": goal_correct / max(goal_total, 1),
         "action_accuracy": action_correct / max(action_total, 1),
         "parameter_accuracy": parameter_correct / max(parameter_total, 1),
+        "parameter_presence_accuracy": parameter_presence_correct / max(parameter_presence_total, 1),
+        "operation_count_accuracy": operation_count_correct / max(samples, 1),
         "semantic_frame_exact_accuracy": frame_exact / max(samples, 1),
         "operation_presence_accuracy": operation_correct / max(operation_total, 1),
         "unsafe_false_execute_rate": unsafe / max(samples, 1),
