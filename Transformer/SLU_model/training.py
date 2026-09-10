@@ -224,18 +224,26 @@ def compute_loss(
                 active_rows.append(row); labels.append(choices.index(value))
         losses["context_reference"] = F.cross_entropy(outputs["context_reference_logits"][active_rows], torch.tensor(labels, dtype=torch.long, device=device)) if labels else zero
     if "operation_relations" in enabled and "operation_relation_logits" in outputs:
-        labels = torch.zeros(outputs["operation_relation_logits"].shape[:3], dtype=torch.long, device=device)
+        labels = torch.full(outputs["operation_relation_logits"].shape[:3], IGNORE_INDEX, dtype=torch.long, device=device)
         for row, target in enumerate(batch["target"]):
+            operation_count = len(target.get("operations", []))
+            if operation_count < 2:
+                continue
+            for source in range(operation_count):
+                for destination in range(operation_count):
+                    if source != destination:
+                        labels[row, source, destination] = 0
             for relation in target.get("relations", []):
                 labels[row, relation["source"], relation["target"]] = OPERATION_RELATIONS.index(relation["type"])
-        losses["operation_relations"] = F.cross_entropy(outputs["operation_relation_logits"].reshape(-1, len(OPERATION_RELATIONS)), labels.reshape(-1))
+        active = labels != IGNORE_INDEX
+        losses["operation_relations"] = F.cross_entropy(outputs["operation_relation_logits"][active], labels[active]) if active.any() else zero
     if "operation_presence" in enabled and "operation_presence_logits" in outputs:
         losses["operation_presence"] = F.binary_cross_entropy_with_logits(outputs["operation_presence_logits"], _target_operation_presence(batch, outputs["operation_presence_logits"].size(1), device))
     if "goal_retrieval" in enabled and "goal_scores" in outputs:
         labels, logits = [], []
         for row, target in enumerate(batch["target"]):
             for index, operation in enumerate(target.get("operations", [])):
-                domain = operation.get("domain", operation.get("goal"))
+                domain = operation["domain"]
                 labels.append(next(i for i, schema in enumerate(schemas) if schema["name"] == domain))
                 logits.append(outputs["goal_scores"][row, index])
         losses["goal_retrieval"] = F.cross_entropy(torch.stack(logits), torch.tensor(labels, dtype=torch.long, device=device)) if logits else zero
@@ -413,6 +421,8 @@ def validate_model(model: VoiceNativeSLU, batches: Iterable[Mapping[str, Any]], 
     goal_correct = goal_total = action_correct = action_total = 0
     parameter_correct = parameter_total = presence_correct = presence_total = 0
     frame_correct = count_correct = 0
+    turn_relation_correct = context_required_correct = context_reference_correct = operation_graph_exact = 0
+    turn_relation_total = context_reference_total = 0
     ctc_invalid = ctc_samples = 0
     total_loss = 0.0
     with torch.no_grad():
@@ -429,6 +439,15 @@ def validate_model(model: VoiceNativeSLU, batches: Iterable[Mapping[str, Any]], 
             operation_total += int(gold_presence.numel()); operation_correct += int((gold_presence == predicted_presence).sum())
             schemas = outputs["capability_schemas"]
             for row, target in enumerate(batch["target"]):
+                turn_relation = target.get("context", {}).get("relation", "NEW")
+                turn_relation_correct += int(TURN_RELATIONS[int(outputs["turn_relation_logits"][row].argmax())] == turn_relation)
+                turn_relation_total += 1
+                expected_required = bool(target.get("context", {}).get("requires_context", False))
+                context_required_correct += int(bool(outputs["context_required_logit"][row].sigmoid() >= 0.5) == expected_required)
+                expected_reference = target.get("context", {}).get("reference_type")
+                if expected_reference is not None:
+                    context_reference_total += 1
+                    context_reference_correct += int(config["relations"]["context_reference_types"][int(outputs["context_reference_logits"][row].argmax())] == expected_reference)
                 gold_count = len(target.get("operations", [])); pred_count = int(predicted_presence[row].sum()); count_correct += int(gold_count == pred_count)
                 exact = predictions[row].item() == labels[row].item() and torch.equal(predicted_presence[row], gold_presence[row]) and gold_count == pred_count
                 for index, operation in enumerate(target.get("operations", [])):
@@ -437,9 +456,19 @@ def validate_model(model: VoiceNativeSLU, batches: Iterable[Mapping[str, Any]], 
                     goal_total += 1; goal_correct += int(predicted_domain == domain); action_total += 1; action_correct += int(predicted_path == path); exact = exact and predicted_domain == domain and predicted_path == path
                 correct, total, params_exact, pcorrect, ptotal = _parameter_exact_match(outputs, {"target": [target]}, schemas, row)
                 parameter_correct += correct; parameter_total += total; presence_correct += pcorrect; presence_total += ptotal; exact = exact and params_exact
-                frame_correct += int(exact)
+                gold_relations = {(r["source"], r["target"], r["type"]) for r in target.get("relations", [])}
+                predicted_relations = set()
+                for source in range(gold_count):
+                    for destination in range(gold_count):
+                        if source != destination:
+                            relation_id = int(outputs["operation_relation_logits"][row, source, destination].argmax())
+                            if relation_id:
+                                predicted_relations.add((source, destination, OPERATION_RELATIONS[relation_id]))
+                graph_exact = gold_relations == predicted_relations
+                operation_graph_exact += int(graph_exact)
+                frame_correct += int(exact and graph_exact and turn_relation_correct == turn_relation_total)
     if not samples: raise ValueError("no validation batches")
-    return {"validation_loss": total_loss / samples, "act_accuracy": act_correct / samples, "goal_retrieval_accuracy": goal_correct / max(goal_total,1), "action_accuracy": action_correct / max(action_total,1), "parameter_presence_accuracy": presence_correct / max(presence_total,1), "parameter_accuracy": parameter_correct / max(parameter_total,1), "operation_presence_accuracy": operation_correct / max(operation_total,1), "operation_count_accuracy": count_correct / samples, "semantic_frame_exact_accuracy": frame_correct / samples, "unsafe_false_execute_rate": unsafe / samples, "ctc_invalid_ratio": ctc_invalid / max(ctc_samples,1)}
+    return {"validation_loss": total_loss / samples, "act_accuracy": act_correct / samples, "goal_retrieval_accuracy": goal_correct / max(goal_total,1), "action_accuracy": action_correct / max(action_total,1), "parameter_presence_accuracy": presence_correct / max(presence_total,1), "parameter_accuracy": parameter_correct / max(parameter_total,1), "operation_presence_accuracy": operation_correct / max(operation_total,1), "operation_count_accuracy": count_correct / samples, "turn_relation_accuracy": turn_relation_correct / max(turn_relation_total,1), "context_required_accuracy": context_required_correct / samples, "context_reference_accuracy": context_reference_correct / max(context_reference_total,1), "operation_graph_exact_accuracy": operation_graph_exact / samples, "turn_understanding_exact_accuracy": frame_correct / samples, "semantic_frame_exact_accuracy": frame_correct / samples, "unsafe_false_execute_rate": unsafe / samples, "ctc_invalid_ratio": ctc_invalid / max(ctc_samples,1)}
 
 
 def assemble_frame(prediction: Mapping[str, Any], config: Mapping[str, Any], *, request_id: str | None = None, model_version: str | None = None, capability_schemas: Sequence[Mapping[str, Any]] | None = None) -> dict[str, Any]:
