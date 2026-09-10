@@ -180,14 +180,20 @@ def validate_target(
     required_context_keys = {"relation", "requires_context", "reference_type"}
     if not required_context_keys <= set(context):
         raise DatasetContractError("target.context requires relation, requires_context, and reference_type keys")
-    if context.get("relation") not in TURN_RELATIONS:
-        raise DatasetContractError("unknown turn relation")
+    relation = context.get("relation")
     requires_context = context.get("requires_context")
+    reference_type = context.get("reference_type")
+    if relation not in TURN_RELATIONS:
+        raise DatasetContractError("unknown turn relation")
     if not isinstance(requires_context, bool):
         raise DatasetContractError("context.requires_context must be boolean")
-    reference_type = context.get("reference_type")
     if reference_type is not None and reference_type not in CONTEXT_REFERENCE_TYPES:
         raise DatasetContractError("unknown context reference type")
+    if relation == "NEW":
+        if requires_context or reference_type is not None:
+            raise DatasetContractError("NEW cannot require or reference prior context")
+    elif not requires_context or reference_type is None:
+        raise DatasetContractError("non-NEW relations require context and reference_type")
 
     operations = target.get("operations", [])
     if not isinstance(operations, list):

@@ -487,8 +487,6 @@ def assemble_frame(prediction: Mapping[str, Any], config: Mapping[str, Any], *, 
     if float(confidence.get("ood",1.0)) > float(config["inference"]["max_ood_score"]): raise DatasetContractError("prediction is out of distribution")
     if float(confidence.get("overall",0.0)) < float(config["inference"]["act_min_confidence"]): raise DatasetContractError("prediction confidence is below threshold")
     operations = copy.deepcopy(frame.get("operations", []))
-    for operation in operations:
-        operation.setdefault("goal", operation.get("domain"))
     return {"model_version": model_version or config["project"]["architecture"], "request_id": request_id, "act": frame["act"], "context": frame.get("context", {}), "operations": operations, "relations": frame.get("relations", []), "confidence": dict(confidence)}
 
 
