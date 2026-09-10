@@ -373,12 +373,11 @@ def train_epoch(
     return total / count
 
 
-def _parameter_exact_match(outputs: Mapping[str, Any], batch: Mapping[str, Any], schemas: Sequence[Mapping[str, Any]], row_index: int = 0) -> tuple[int, int, bool, int, int]:
+def _parameter_exact_match(outputs: Mapping[str, Any], target: Mapping[str, Any], schemas: Sequence[Mapping[str, Any]], output_row: int = 0) -> tuple[int, int, bool, int, int]:
     """Evaluate all parameter slots, including absent optional slots."""
 
     correct = total = presence_correct = presence_total = 0
     frame_correct = True
-    target = batch["target"][row_index]
     schema_map = _schema_map(schemas)
     for operation_index, operation in enumerate(target.get("operations", [])):
         domain = str(operation["domain"]); path = str(operation["action"]).removeprefix(f"{domain}.")
@@ -387,28 +386,28 @@ def _parameter_exact_match(outputs: Mapping[str, Any], batch: Mapping[str, Any],
         for name, parameter in action_schema.get("parameters", {}).items():
             head = outputs["parameter_outputs"][domain][path][name]
             gold_present = name in gold
-            predicted_present = int(head["presence_logits"][row_index, operation_index].argmax()) == 1
+            predicted_present = int(head["presence_logits"][output_row, operation_index].argmax()) == 1
             slot_correct = gold_present == predicted_present
             presence_correct += int(slot_correct); presence_total += 1
             if gold_present and predicted_present:
                 value = gold[name]; kind = parameter["type"]
-                if kind == "ENUM": slot_correct = parameter["values"][int(head["enum_logits"][row_index, operation_index].argmax())] == value
-                elif kind == "NUMBER": slot_correct = abs(float(head["number_value"][row_index, operation_index]) - float(value)) <= 1
-                elif kind == "BOOLEAN": slot_correct = bool(head["boolean_logits"][row_index, operation_index].argmax()) == value
+                if kind == "ENUM": slot_correct = parameter["values"][int(head["enum_logits"][output_row, operation_index].argmax())] == value
+                elif kind == "NUMBER": slot_correct = abs(float(head["number_value"][output_row, operation_index]) - float(value)) <= 1
+                elif kind == "BOOLEAN": slot_correct = bool(head["boolean_logits"][output_row, operation_index].argmax()) == value
                 elif kind in {"STATE_REFERENCE", "CONTEXT_REFERENCE"}:
                     key = "reference_logits" if kind == "STATE_REFERENCE" else "context_reference_logits"
                     choices = parameter.get("state_reference_paths", parameter.get("context_reference_types", []))
-                    slot_correct = key in head and choices[int(head[key][row_index, operation_index].argmax())] == value.get("path", value.get("reference_type"))
+                    slot_correct = key in head and choices[int(head[key][output_row, operation_index].argmax())] == value.get("path", value.get("reference_type"))
                 elif kind in {"ENTITY", "FREE_TEXT"}:
                     source = value.get("source") if isinstance(value, Mapping) else None
-                    source_id = int(head["source_logits"][row_index, operation_index].argmax())
+                    source_id = int(head["source_logits"][output_row, operation_index].argmax())
                     if source == "state_reference":
-                        slot_correct = source_id == SpanExtractor.SOURCES.index("STATE_REFERENCE") and "reference_logits" in head and parameter["state_reference_paths"][int(head["reference_logits"][row_index, operation_index].argmax())] == value["path"]
+                        slot_correct = source_id == SpanExtractor.SOURCES.index("STATE_REFERENCE") and "reference_logits" in head and parameter["state_reference_paths"][int(head["reference_logits"][output_row, operation_index].argmax())] == value["path"]
                     elif source == "input_span":
                         frame_count = head["span_start_logits"].size(-1)
                         expected_start = round(float(value["alignment"]["start"]) * (frame_count - 1))
                         expected_end = round(float(value["alignment"]["end"]) * (frame_count - 1))
-                        slot_correct = source_id == SpanExtractor.SOURCES.index("INPUT_SPAN") and abs(int(head["span_start_logits"][row_index, operation_index].argmax()) - expected_start) <= 1 and abs(int(head["span_end_logits"][row_index, operation_index].argmax()) - expected_end) <= 1
+                        slot_correct = source_id == SpanExtractor.SOURCES.index("INPUT_SPAN") and abs(int(head["span_start_logits"][output_row, operation_index].argmax()) - expected_start) <= 1 and abs(int(head["span_end_logits"][output_row, operation_index].argmax()) - expected_end) <= 1
                     else: slot_correct = False
                 else: slot_correct = False
             correct += int(slot_correct); total += 1; frame_correct = frame_correct and slot_correct
@@ -455,7 +454,7 @@ def validate_model(model: VoiceNativeSLU, batches: Iterable[Mapping[str, Any]], 
                     domain = operation["domain"]; path = operation["action"].removeprefix(f"{domain}."); schema_index = next(i for i,schema in enumerate(schemas) if schema["name"] == domain)
                     predicted_domain = schemas[int(outputs["goal_scores"][row,index].argmax())]["name"]; predicted_path = list(schemas[schema_index]["actions"].keys())[int(outputs["action_scores"][schema_index][row,index].argmax())]
                     goal_total += 1; goal_correct += int(predicted_domain == domain); action_total += 1; action_correct += int(predicted_path == path); exact = exact and predicted_domain == domain and predicted_path == path
-                correct, total, params_exact, pcorrect, ptotal = _parameter_exact_match(outputs, {"target": [target]}, schemas, row)
+                correct, total, params_exact, pcorrect, ptotal = _parameter_exact_match(outputs, target, schemas, output_row=row)
                 parameter_correct += correct; parameter_total += total; presence_correct += pcorrect; presence_total += ptotal; exact = exact and params_exact
                 gold_relations = {(r["source"], r["target"], r["type"]) for r in target.get("relations", [])}
                 predicted_relations = set()
@@ -483,7 +482,8 @@ def assemble_frame(prediction: Mapping[str, Any], config: Mapping[str, Any], *, 
     frame = copy.deepcopy(dict(prediction)); confidence = frame.get("confidence")
     if not isinstance(confidence, Mapping): raise DatasetContractError("confidence is required")
     if any(not isinstance(value,(int,float)) or not 0 <= float(value) <= 1 for value in confidence.values()): raise DatasetContractError("confidence values must be in [0,1]")
-    validate_target({"act": frame.get("act"), "context": frame.get("context", {}), "operations": frame.get("operations", []), "relations": frame.get("relations", [])}, config, capability_schemas=capability_schemas)
+    frame_context = frame.get("context") or {"relation": "NEW", "requires_context": False, "reference_type": None}
+    validate_target({"act": frame.get("act"), "context": frame_context, "operations": frame.get("operations", []), "relations": frame.get("relations", [])}, config, capability_schemas=capability_schemas)
     if float(confidence.get("ood",1.0)) > float(config["inference"]["max_ood_score"]): raise DatasetContractError("prediction is out of distribution")
     if float(confidence.get("overall",0.0)) < float(config["inference"]["act_min_confidence"]): raise DatasetContractError("prediction confidence is below threshold")
     operations = copy.deepcopy(frame.get("operations", []))

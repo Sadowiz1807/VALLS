@@ -175,17 +175,19 @@ def validate_target(
         raise DatasetContractError("V1 target.context is required")
     context = target["context"]
     requires_context = False
-    if context:
-        if not isinstance(context, Mapping):
-            raise DatasetContractError("target.context must be an object")
-        if context.get("relation") not in TURN_RELATIONS:
-            raise DatasetContractError("unknown turn relation")
-        requires_context = context.get("requires_context", False)
-        if not isinstance(requires_context, bool):
-            raise DatasetContractError("context.requires_context must be boolean")
-        reference_type = context.get("reference_type")
-        if reference_type is not None and reference_type not in CONTEXT_REFERENCE_TYPES:
-            raise DatasetContractError("unknown context reference type")
+    if not isinstance(context, Mapping):
+        raise DatasetContractError("target.context must be an object")
+    required_context_keys = {"relation", "requires_context", "reference_type"}
+    if not required_context_keys <= set(context):
+        raise DatasetContractError("target.context requires relation, requires_context, and reference_type keys")
+    if context.get("relation") not in TURN_RELATIONS:
+        raise DatasetContractError("unknown turn relation")
+    requires_context = context.get("requires_context")
+    if not isinstance(requires_context, bool):
+        raise DatasetContractError("context.requires_context must be boolean")
+    reference_type = context.get("reference_type")
+    if reference_type is not None and reference_type not in CONTEXT_REFERENCE_TYPES:
+        raise DatasetContractError("unknown context reference type")
 
     operations = target.get("operations", [])
     if not isinstance(operations, list):
@@ -216,8 +218,6 @@ def validate_target(
         if not isinstance(parameters, Mapping):
             raise DatasetContractError("operation.parameters must be an object")
         parameter_schemas = action_schema.get("parameters", {})
-        if not parameter_schemas and isinstance(schemas[domain].get("parameters"), Mapping):
-            parameter_schemas = schemas[domain]["parameters"]
         extra = set(parameters) - set(parameter_schemas)
         if extra:
             raise DatasetContractError(f"unknown parameters for {action_id}: {sorted(extra)}")
