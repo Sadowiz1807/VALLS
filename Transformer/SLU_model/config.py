@@ -1,4 +1,4 @@
-"""Configuration and capability schemas for the voice-native VALLS SLU V0 model."""
+"""VALLS SLU V1 configuration and action-specific semantic schemas."""
 
 from __future__ import annotations
 
@@ -7,29 +7,24 @@ import json
 from pathlib import Path
 from typing import Any, Mapping
 
-CONFIG_VERSION = "VALLS-SLU-V0"
-MODEL_ARCHITECTURE = "voice_native_slu_v0"
-CONTRACT_VERSION = "1.0"
+CONFIG_VERSION = "VALLS-SLU-V1"
+MODEL_ARCHITECTURE = "voice_native_slu_v1"
+CONTRACT_VERSION = "2.0"
 DEFAULT_CONFIG_PATH = Path(__file__).with_name("config.json")
 
-ACTS = [
-    "EXECUTE",
-    "ASK_CLARIFICATION",
-    "CONFIRM",
-    "CANCEL",
-    "RESPOND",
-    "UNSUPPORTED",
-]
-PARAMETER_TYPES = {"ENUM", "NUMBER", "ENTITY", "STATE_REFERENCE", "FREE_TEXT", "BOOLEAN"}
+ACTS = ["EXECUTE", "ASK_CLARIFICATION", "CONFIRM", "CANCEL", "RESPOND", "UNSUPPORTED"]
+ROOT_ACTION_DOMAINS = ["APPLICATION_CONTROL", "WEB_CONTROL", "SYSTEM_CONTROL", "RUN_COMMAND"]
+PARAMETER_TYPES = {"ENUM", "NUMBER", "ENTITY", "FREE_TEXT", "BOOLEAN", "STATE_REFERENCE", "CONTEXT_REFERENCE"}
+TURN_RELATIONS = ["NEW", "APPEND_AFTER", "MODIFY", "SUPERSEDE", "CONTINUE", "REPEAT", "REFERENCE"]
+OPERATION_RELATIONS = ["NONE", "AFTER_SUCCESS", "AFTER_FAILURE", "AFTER_TERMINAL", "AFTER_START"]
+CONTEXT_REFERENCE_TYPES = ["FOCUSED_ACTION", "ACTIVE_APPLICATION", "ACTIVE_BROWSER", "ACTIVE_TAB", "LAST_OPERATION"]
 INPUT_SPAN = "INPUT_SPAN"
 STATE_REFERENCE = "STATE_REFERENCE"
-ABSENT = "ABSENT"
+CONTEXT_REFERENCE = "CONTEXT_REFERENCE"
 IGNORE_INDEX = -100
 
 
 def default_lexical_vocab() -> list[str]:
-    """Return a vocabulary that can represent every UTF-8 transcript byte."""
-
     return ["<BLANK>"] + [f"<BYTE:{value:02x}>" for value in range(256)]
 
 
@@ -42,12 +37,9 @@ def _parameter(
     minimum: float | None = None,
     maximum: float | None = None,
     state_reference_paths: list[str] | None = None,
+    context_reference_types: list[str] | None = None,
 ) -> dict[str, Any]:
-    result: dict[str, Any] = {
-        "type": parameter_type,
-        "description": description,
-        "required": required,
-    }
+    result: dict[str, Any] = {"type": parameter_type, "description": description, "required": required}
     if values is not None:
         result["values"] = list(values)
     if minimum is not None:
@@ -56,244 +48,126 @@ def _parameter(
         result["maximum"] = maximum
     if state_reference_paths:
         result["state_reference_paths"] = list(state_reference_paths)
+    if context_reference_types:
+        result["context_reference_types"] = list(context_reference_types)
     return result
 
 
-def _capability(
-    description: str,
-    actions: list[str],
-    parameters: dict[str, dict[str, Any]],
-) -> dict[str, Any]:
-    return {
-        "description": description,
-        "actions": list(actions),
-        "parameters": parameters,
-    }
+def _action(description: str, parameters: dict[str, dict[str, Any]] | None = None) -> dict[str, Any]:
+    return {"description": description, "parameters": parameters or {}}
+
+
+def _capability(description: str, actions: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    return {"description": description, "actions": actions}
+
+
+def _entity(description: str, required: bool = False) -> dict[str, Any]:
+    return _parameter("ENTITY", description, required=required)
+
+
+def _free_text(description: str, required: bool = False) -> dict[str, Any]:
+    return _parameter("FREE_TEXT", description, required=required)
+
+
+def _browser() -> dict[str, Any]:
+    return _entity("Browser name or alias.")
 
 
 def _default_capabilities() -> dict[str, dict[str, Any]]:
-    """The initial registry; the model can score any runtime schema set."""
-
+    app = _entity("Native/local application name or alias.", required=True)
+    optional_app = _entity("Native/local application name or alias.")
+    browser = _browser()
     return {
         "APPLICATION_CONTROL": _capability(
-            "Open, close, focus, or otherwise control a supported application.",
-            ["OPEN", "CLOSE", "FOCUS"],
+            "Control native/local applications.",
             {
-                "application": _parameter(
-                    "ENTITY",
-                    "Name or alias of the application.",
-                    required=True,
-                    state_reference_paths=["state.current_target_application"],
-                ),
+                "OPEN": _action("Open an application.", {"application": app}),
+                "CLOSE": _action("Close an application.", {"application": app}),
+                "FOCUS": _action("Focus an application.", {"application": app}),
+                "PLAY": _action("Play media through a native application.", {"application": app, "query": _free_text("Media query.", True)}),
+                "PAUSE": _action("Pause native application media.", {"application": optional_app}),
+                "RESUME": _action("Resume native application media.", {"application": optional_app}),
+                "STOP": _action("Stop native application media.", {"application": optional_app}),
+                "NEXT": _action("Skip to next native application media.", {"application": optional_app}),
+                "PREVIOUS": _action("Skip to previous native application media.", {"application": optional_app}),
             },
         ),
-        "MEDIA_CONTROL": _capability(
-            "Control playback or volume for a supported media provider.",
-            ["PLAY", "PAUSE", "RESUME", "STOP", "NEXT", "PREVIOUS", "VOLUME_UP", "VOLUME_DOWN", "SET_VOLUME"],
+        "WEB_CONTROL": _capability(
+            "Control browsers, websites, web media, tabs, and navigation.",
             {
-                "query": _parameter("FREE_TEXT", "Optional media or track query.", state_reference_paths=["state.active_media"]),
-                "platform": _parameter("ENUM", "Media platform.", values=["YOUTUBE", "SPOTIFY", "LOCAL", "DEFAULT"]),
-                "volume": _parameter("NUMBER", "Target volume percentage.", minimum=0, maximum=100),
+                "OPEN": _action("Open a web target.", {"target": _free_text("URL or web target.", True), "browser": browser}),
+                "SEARCH": _action("Search the web.", {"query": _free_text("Search query.", True), "browser": browser, "engine": _entity("Search engine name or alias.")}),
+                "BACK": _action("Navigate back in a browser.", {"browser": browser}),
+                "FORWARD": _action("Navigate forward in a browser.", {"browser": browser}),
+                "REFRESH": _action("Refresh a browser page.", {"browser": browser}),
+                "SCROLL_UP": _action("Scroll up in a browser.", {"amount": _parameter("NUMBER", "Scroll amount.", minimum=1, maximum=10), "browser": browser}),
+                "SCROLL_DOWN": _action("Scroll down in a browser.", {"amount": _parameter("NUMBER", "Scroll amount.", minimum=1, maximum=10), "browser": browser}),
+                "TAB.NEW": _action("Open a new browser tab.", {"browser": browser}),
+                "TAB.CLOSE": _action("Close a browser tab.", {"tab_reference": _parameter("CONTEXT_REFERENCE", "Semantic tab reference.", context_reference_types=["ACTIVE_TAB", "FOCUSED_ACTION"])}),
+                "TAB.SWITCH": _action("Switch to a browser tab.", {"tab_reference": _parameter("CONTEXT_REFERENCE", "Semantic tab reference.", required=True, context_reference_types=["ACTIVE_TAB", "FOCUSED_ACTION"])}),
+                "TAB.REOPEN": _action("Reopen a browser tab."),
+                "PLAY": _action("Play media through a website or browser.", {"query": _free_text("Media query.", True), "site": _entity("Website or media site."), "browser": browser}),
+                "PAUSE": _action("Pause web media.", {"browser": browser}),
+                "RESUME": _action("Resume web media.", {"browser": browser}),
+                "STOP": _action("Stop web media.", {"browser": browser}),
+                "NEXT": _action("Skip to next web media.", {"browser": browser}),
+                "PREVIOUS": _action("Skip to previous web media.", {"browser": browser}),
             },
         ),
-        "WEB_OPEN": _capability(
-            "Open a URL or web target in a supported browser.",
-            ["OPEN"],
+        "SYSTEM_CONTROL": _capability(
+            "Control operating-system and device state.",
             {
-                "target": _parameter("FREE_TEXT", "URL or web target.", required=True, state_reference_paths=["state.active_url"]),
-                "browser": _parameter("ENTITY", "Browser to use.", state_reference_paths=["state.active_browser"]),
-            },
-        ),
-        "WEB_SEARCH": _capability(
-            "Search the web using a supported search provider.",
-            ["SEARCH"],
-            {
-                "query": _parameter("FREE_TEXT", "The natural-language search query.", required=True),
-                "engine": _parameter("ENTITY", "Optional search engine."),
-            },
-        ),
-        "WEB_NAVIGATE": _capability(
-            "Navigate within the active browser page.",
-            ["BACK", "FORWARD", "REFRESH", "SCROLL_UP", "SCROLL_DOWN", "GO_HOME"],
-            {
-                "amount": _parameter("NUMBER", "Scroll amount.", minimum=1, maximum=10),
-            },
-        ),
-        "TAB_CONTROL": _capability(
-            "Create, close, switch, or reopen a browser tab.",
-            ["NEW", "CLOSE", "SWITCH", "REOPEN"],
-            {
-                "tab_index": _parameter("NUMBER", "One-based tab index.", minimum=1),
-                "tab_reference": _parameter("STATE_REFERENCE", "Reference to the active browser.", state_reference_paths=["state.active_browser"]),
+                "MEDIA.SET_VOLUME": _action("Set device output volume.", {"volume": _parameter("NUMBER", "Device volume percentage.", required=True, minimum=0, maximum=100)}),
+                "MEDIA.VOLUME_UP": _action("Increase device output volume.", {"amount": _parameter("NUMBER", "Volume step.", minimum=1, maximum=100)}),
+                "MEDIA.VOLUME_DOWN": _action("Decrease device output volume.", {"amount": _parameter("NUMBER", "Volume step.", minimum=1, maximum=100)}),
+                "MEDIA.MUTE": _action("Mute device output."),
+                "MEDIA.UNMUTE": _action("Unmute device output."),
+                "POWER.LOCK": _action("Lock the device."),
+                "POWER.SHUTDOWN": _action("Shut down the device."),
+                "POWER.RESTART": _action("Restart the device."),
+                "POWER.SLEEP": _action("Put the device to sleep."),
+                "SCREENSHOT.CAPTURE": _action("Capture a screenshot."),
             },
         ),
         "RUN_COMMAND": _capability(
-            "Run a registered safe system command through the harness.",
-            ["RUN"],
-            {
-                "command_id": _parameter(
-                    "ENUM",
-                    "Registered command identifier.",
-                    required=True,
-                    values=["LOCK_SCREEN", "SHUTDOWN_SYSTEM", "RESTART_SYSTEM", "SLEEP_SYSTEM", "TAKE_SCREENSHOT", "SET_VOLUME"],
-                ),
-            },
-        ),
-        "TASK_STATUS": _capability(
-            "Report the status of a previous or active task.",
-            ["STATUS"],
-            {"scope": _parameter("ENUM", "Task scope.", values=["LAST_TASK", "ACTIVE_TASK"])},
-        ),
-        "SOCIAL_RESPONSE": _capability(
-            "Respond to a social utterance without executing a system operation.",
-            ["RESPOND"],
-            {"intent": _parameter("ENUM", "Social intent.", required=True, values=["GREETING", "THANKS", "GOODBYE", "ACKNOWLEDGEMENT"])},
+            "Run a registered safe command through the Harness.",
+            {"EXECUTE": _action("Execute a registered command.", {"command_id": _entity("Registered command identifier or alias.", True), "arguments": _free_text("Registered command arguments.")})},
         ),
     }
 
 
-def capability_schemas(config: Mapping[str, Any]) -> list[dict[str, Any]]:
-    """Convert the config registry to the runtime schema representation."""
+def canonical_action_id(domain: str, action_path: str) -> str:
+    return f"{domain}.{action_path}"
 
-    ontology = config["ontology"]
-    return [
-        {"name": name, **copy.deepcopy(ontology["capabilities"][name])}
-        for name in ontology["schema_order"]
-    ]
+
+def capability_schemas(config: Mapping[str, Any]) -> list[dict[str, Any]]:
+    return [{"name": name, **copy.deepcopy(config["ontology"]["capabilities"][name])} for name in config["ontology"]["schema_order"]]
+
+
+def count_action_slots(config: Mapping[str, Any]) -> tuple[int, int]:
+    capabilities = config["ontology"]["capabilities"]
+    actions = sum(len(schema["actions"]) for schema in capabilities.values())
+    slots = sum(len(action["parameters"]) for schema in capabilities.values() for action in schema["actions"].values())
+    return actions, slots
 
 
 def get_config() -> dict[str, Any]:
     lexical_vocab = default_lexical_vocab()
     capabilities = _default_capabilities()
     return {
-        "project": {
-            "name": "VALLS",
-            "task": "voice_native_spoken_language_understanding",
-            "architecture": CONFIG_VERSION,
-            "contract_version": CONTRACT_VERSION,
-        },
-        "audio": {
-            "sample_rate": 16_000,
-            "channels": 1,
-            "frontend": "log_mel",
-            "feature_dim": 80,
-            "n_fft": 400,
-            "hop_length": 160,
-            "win_length": 400,
-            "f_min": 0.0,
-            "f_max": 8_000.0,
-        },
-        "speech_encoder": {
-            "architecture": "conformer",
-            "d_model": 512,
-            "layers": 8,
-            "attention_heads": 8,
-            "d_ff": 2_048,
-            "dropout": 0.1,
-            "subsampling_factor": 4,
-            "conv_kernel_size": 31,
-        },
-        "semantic_resampler": {
-            "type": "learnable_query_cross_attention",
-            "latent_tokens": 32,
-            "d_model": 512,
-            "attention_heads": 8,
-            "dropout": 0.1,
-        },
-        "semantic_core": {
-            "type": "transformer_encoder",
-            "layers": 4,
-            "d_model": 512,
-            "attention_heads": 8,
-            "d_ff": 2_048,
-            "dropout": 0.1,
-        },
-        "operation_decoder": {
-            "type": "learned_query_cross_attention",
-            "max_operations": 2,
-            "d_model": 512,
-            "attention_heads": 8,
-            "dropout": 0.1,
-        },
-        "lexical_branch": {
-            "enabled": True,
-            "type": "ctc_utf8_bytes",
-            "vocab_size": len(lexical_vocab),
-            "blank_id": 0,
-            "vocab_artifact": "lexical_vocab.json",
-            "vocab": lexical_vocab,
-        },
-        "model": {
-            "architecture": MODEL_ARCHITECTURE,
-            "d_model": 512,
-            "gradient_checkpointing": True,
-        },
-        "ontology": {
-            "acts": list(ACTS),
-            "capabilities": capabilities,
-            "schema_order": list(capabilities),
-        },
-        "data": {
-            "train_path": "Data/valls_slu_v0/train.jsonl",
-            "validation_path": "Data/valls_slu_v0/validation.jsonl",
-            "test_path": "Data/valls_slu_v0/test.jsonl",
-            "required_fields": ["sample_id", "audio", "target"],
-            "transcript_required_for": ["ENTITY", "FREE_TEXT"],
-        },
-        "training": {
-            "seed": 42,
-            "epochs": 20,
-            "batch_size": 4,
-            "validation_batch_size": 4,
-            "gradient_accumulation_steps": 4,
-            "learning_rate": 1e-4,
-            "weight_decay": 0.01,
-            "gradient_clip_norm": 1.0,
-            "precision": "fp16_mixed",
-            "num_workers": 0,
-            "checkpoint_dir": "artifacts/valls_slu_v0/checkpoints",
-            "checkpoint_prefix": "valls_slu_v0",
-            "auto_resume": True,
-            "resume_from": None,
-            "loss_weights": {
-                "act": 1.0,
-                "operation_presence": 1.0,
-                "goal_retrieval": 1.0,
-                "action": 1.0,
-                "parameters": 1.0,
-                "confidence": 0.25,
-                "ood": 0.5,
-                "lexical": 0.25,
-                "bridge_alignment": 0.5,
-                "parameter_presence_negative_weight": 0.25,
-                "parameter_hard_negative_schemas": 4,
-            },
-            "stages": {
-                "ACOUSTIC": {"enabled_losses": ["lexical"], "lexical_source": "speech", "learning_rate_multiplier": 1.0},
-                "BRIDGE": {"enabled_losses": ["bridge_alignment"], "learning_rate_multiplier": 0.5},
-                "SEMANTIC": {"enabled_losses": ["act", "operation_presence", "goal_retrieval", "action"], "learning_rate_multiplier": 1.0},
-                "PARAMETER": {"enabled_losses": ["parameters"], "learning_rate_multiplier": 0.5},
-                "SAFETY": {"enabled_losses": ["confidence", "ood"], "learning_rate_multiplier": 0.5},
-                "JOINT": {"enabled_losses": ["act", "operation_presence", "goal_retrieval", "action", "parameters", "confidence", "ood", "lexical"], "lexical_source": "speech", "learning_rate_multiplier": 1.0},
-            },
-        },
-        "evaluation": {
-            "act_accuracy": 0.95,
-            "goal_retrieval_accuracy": 0.92,
-            "action_accuracy": 0.92,
-            "parameter_accuracy": 0.90,
-            "unsafe_false_execute_rate": 0.0,
-            "unsupported_recall": 0.90,
-            "invalid_frame_rate": 0.0,
-        },
-        "inference": {
-            "act_min_confidence": 0.70,
-            "goal_min_confidence": 0.70,
-            "action_min_confidence": 0.60,
-            "parameter_min_confidence": 0.60,
-            "operation_presence_threshold": 0.50,
-            "max_ood_score": 0.50,
-        },
+        "project": {"name": "VALLS", "task": "voice_native_spoken_language_understanding", "architecture": CONFIG_VERSION, "contract_version": CONTRACT_VERSION},
+        "audio": {"sample_rate": 16000, "channels": 1, "frontend": "log_mel", "feature_dim": 80, "n_fft": 400, "hop_length": 160, "win_length": 400, "f_min": 0.0, "f_max": 8000.0},
+        "speech_encoder": {"architecture": "conformer", "d_model": 512, "layers": 8, "attention_heads": 8, "d_ff": 2048, "dropout": 0.1, "subsampling_factor": 4, "conv_kernel_size": 31},
+        "semantic_resampler": {"type": "learnable_query_cross_attention", "latent_tokens": 32, "d_model": 512, "attention_heads": 8, "dropout": 0.1},
+        "semantic_core": {"type": "transformer_encoder", "layers": 4, "d_model": 512, "attention_heads": 8, "d_ff": 2048, "dropout": 0.1},
+        "operation_decoder": {"type": "learned_query_cross_attention", "max_operations": 2, "d_model": 512, "attention_heads": 8, "dropout": 0.1},
+        "lexical_branch": {"enabled": True, "type": "ctc_utf8_bytes", "vocab_size": len(lexical_vocab), "blank_id": 0, "vocab_artifact": "lexical_vocab.json", "vocab": lexical_vocab},
+        "model": {"architecture": MODEL_ARCHITECTURE, "d_model": 512, "gradient_checkpointing": True},
+        "ontology": {"acts": list(ACTS), "root_action_domains": list(ROOT_ACTION_DOMAINS), "capabilities": capabilities, "schema_order": list(capabilities)},
+        "relations": {"turn": list(TURN_RELATIONS), "operation": list(OPERATION_RELATIONS), "context_reference_types": list(CONTEXT_REFERENCE_TYPES)},
+        "data": {"required_fields": ["sample_id", "audio", "target"], "transcript_required_for": ["ENTITY", "FREE_TEXT"]},
+        "training": {"seed": 42, "epochs": 20, "batch_size": 4, "validation_batch_size": 4, "gradient_accumulation_steps": 4, "learning_rate": 1e-4, "weight_decay": 0.01, "gradient_clip_norm": 1.0, "precision": "fp16_mixed", "num_workers": 0, "loss_weights": {"act": 1.0, "operation_presence": 1.0, "goal_retrieval": 1.0, "action": 1.0, "parameters": 1.0, "turn_relation": 0.5, "context_required": 0.5, "context_reference": 0.5, "operation_relations": 0.5, "confidence": 0.25, "ood": 0.5, "lexical": 0.25, "bridge_alignment": 0.5, "parameter_presence_negative_weight": 0.25, "parameter_hard_negative_schemas": 4}, "stages": {"ACOUSTIC": {"enabled_losses": ["lexical"]}, "BRIDGE": {"enabled_losses": ["bridge_alignment"]}, "SEMANTIC": {"enabled_losses": ["act", "operation_presence", "goal_retrieval", "action", "turn_relation", "context_required", "context_reference", "operation_relations"]}, "PARAMETER": {"enabled_losses": ["parameters"]}, "SAFETY": {"enabled_losses": ["confidence", "ood"]}, "JOINT": {"enabled_losses": ["act", "operation_presence", "goal_retrieval", "action", "parameters", "turn_relation", "context_required", "context_reference", "operation_relations", "confidence", "ood", "lexical"]}}},
+        "inference": {"act_min_confidence": 0.70, "goal_min_confidence": 0.70, "action_min_confidence": 0.60, "parameter_min_confidence": 0.60, "operation_presence_threshold": 0.50, "max_ood_score": 0.50},
     }
 
 
@@ -303,101 +177,46 @@ def _require(condition: bool, message: str) -> None:
 
 
 def validate_config(config: Mapping[str, Any]) -> None:
-    """Validate the persisted V0 architecture and dynamic capability contract."""
-
-    _require(isinstance(config, Mapping), "config must be an object")
-    project = config.get("project")
-    _require(isinstance(project, Mapping), "project must be an object")
-    _require(project.get("architecture") == CONFIG_VERSION, "unsupported model architecture")
-    _require(project.get("contract_version") == CONTRACT_VERSION, "unsupported contract version")
-
-    audio = config.get("audio")
-    _require(isinstance(audio, Mapping), "audio must be an object")
-    for key in ("sample_rate", "channels", "feature_dim", "n_fft", "hop_length", "win_length"):
-        _require(isinstance(audio.get(key), int) and audio[key] > 0, f"audio.{key} must be positive")
-    _require(audio["channels"] == 1, "V0 requires mono audio")
-    _require(audio["win_length"] <= audio["n_fft"], "audio.win_length cannot exceed n_fft")
-
-    dimensions: list[int] = []
-    for section_name in ("speech_encoder", "semantic_resampler", "semantic_core", "operation_decoder"):
-        section = config.get(section_name)
-        _require(isinstance(section, Mapping), f"{section_name} must be an object")
-        for key in ("d_model", "attention_heads"):
-            _require(isinstance(section.get(key), int) and section[key] > 0, f"{section_name}.{key} must be positive")
-        _require(section["d_model"] % section["attention_heads"] == 0, f"{section_name}.d_model must divide attention_heads")
-        dimensions.append(section["d_model"])
-        if "layers" in section:
-            _require(isinstance(section["layers"], int) and section["layers"] > 0, f"{section_name}.layers must be positive")
-        _require(0 <= float(section.get("dropout", 0.0)) < 1, f"{section_name}.dropout must be in [0, 1)")
-    _require(len(set(dimensions)) == 1, "all V0 representation dimensions must match")
-    model = config.get("model")
-    _require(isinstance(model, Mapping), "model must be an object")
-    _require(model.get("architecture") == MODEL_ARCHITECTURE, "model architecture mismatch")
-    _require(model.get("d_model") == dimensions[0], "model.d_model must match representation dimensions")
-
-    speech = config["speech_encoder"]
-    _require(speech.get("architecture") in {"conformer", "transformer_speech_encoder"}, "unsupported speech encoder")
-    if speech.get("architecture") == "conformer":
-        _require(int(speech.get("conv_kernel_size", 0)) > 1 and int(speech["conv_kernel_size"]) % 2 == 1, "Conformer kernel must be odd and > 1")
-
-    lexical = config.get("lexical_branch")
-    _require(isinstance(lexical, Mapping), "lexical_branch must be an object")
-    vocab = lexical.get("vocab")
-    _require(isinstance(vocab, list) and len(vocab) == lexical.get("vocab_size"), "lexical vocab must match vocab_size")
-    _require(0 <= int(lexical.get("blank_id", -1)) < len(vocab), "invalid lexical blank_id")
-
-    ontology = config.get("ontology")
-    _require(isinstance(ontology, Mapping), "ontology must be an object")
-    _require(ontology.get("acts") == list(ACTS), "ontology.acts must use the V0 ACT contract")
-    capabilities = ontology.get("capabilities")
-    schema_order = ontology.get("schema_order")
-    _require(isinstance(capabilities, Mapping) and capabilities, "ontology.capabilities must be non-empty")
-    _require(isinstance(schema_order, list) and set(schema_order) == set(capabilities), "schema_order must cover capabilities exactly")
-    for goal in schema_order:
-        schema = capabilities[goal]
-        _require(isinstance(schema, Mapping) and isinstance(schema.get("description"), str) and schema["description"], f"invalid capability: {goal}")
-        actions = schema.get("actions")
-        _require(isinstance(actions, list) and actions and len(actions) == len(set(actions)), f"{goal}.actions must be unique")
-        parameters = schema.get("parameters")
-        _require(isinstance(parameters, Mapping), f"{goal}.parameters must be an object")
-        for name, parameter in parameters.items():
-            _require(isinstance(name, str) and name, f"invalid parameter name in {goal}")
-            _require(isinstance(parameter, Mapping), f"invalid parameter schema: {goal}.{name}")
-            parameter_type = parameter.get("type")
-            _require(parameter_type in PARAMETER_TYPES, f"unsupported parameter type: {goal}.{name}")
-            _require(isinstance(parameter.get("description"), str) and parameter["description"], f"missing description: {goal}.{name}")
-            if parameter_type == "ENUM":
-                values = parameter.get("values")
-                _require(isinstance(values, list) and values and len(values) == len(set(values)), f"{goal}.{name} enum must be unique")
-            if parameter_type == "NUMBER":
-                if parameter.get("minimum") is not None and parameter.get("maximum") is not None:
-                    _require(float(parameter["minimum"]) <= float(parameter["maximum"]), f"invalid numeric range: {goal}.{name}")
-            references = parameter.get("state_reference_paths", [])
-            _require(isinstance(references, list) and len(references) == len(set(references)), f"invalid state references: {goal}.{name}")
-
-    inference = config.get("inference")
-    _require(isinstance(inference, Mapping), "inference must be an object")
-    for key in ("act_min_confidence", "goal_min_confidence", "action_min_confidence", "parameter_min_confidence", "operation_presence_threshold", "max_ood_score"):
-        value = float(inference.get(key, -1))
-        _require(0 <= value <= 1, f"inference.{key} must be in [0, 1]")
+    _require(config["project"]["architecture"] == CONFIG_VERSION, "unsupported V1 architecture")
+    _require(config["project"]["contract_version"] == CONTRACT_VERSION, "unsupported V1 contract")
+    _require(config["ontology"]["acts"] == ACTS, "invalid ACT ontology")
+    domains = config["ontology"]["root_action_domains"]
+    _require(domains == ROOT_ACTION_DOMAINS, "V1 requires exactly four root action domains")
+    capabilities = config["ontology"]["capabilities"]
+    _require(set(capabilities) == set(ROOT_ACTION_DOMAINS), "old or unknown root domain exists")
+    seen: set[str] = set()
+    action_count = slot_count = 0
+    for domain in ROOT_ACTION_DOMAINS:
+        schema = capabilities[domain]
+        _require(isinstance(schema.get("actions"), Mapping), f"{domain}.actions must be a dict")
+        for path, action in schema["actions"].items():
+            _require(path and not path.startswith(".") and not path.endswith(".") and ".." not in path, f"invalid action path: {domain}.{path}")
+            canonical = canonical_action_id(domain, path)
+            _require(canonical not in seen, f"duplicate canonical action: {canonical}")
+            seen.add(canonical); action_count += 1
+            parameters = action.get("parameters", {})
+            _require(isinstance(parameters, Mapping), f"{canonical}.parameters must be a dict")
+            slot_count += len(parameters)
+            for name, parameter in parameters.items():
+                _require(parameter.get("type") in PARAMETER_TYPES, f"invalid parameter type: {canonical}.{name}")
+                _require(isinstance(parameter.get("required"), bool), f"required must be bool: {canonical}.{name}")
+                if parameter["type"] == "ENUM":
+                    _require(isinstance(parameter.get("values"), list) and parameter["values"], f"ENUM requires values: {canonical}.{name}")
+    _require(action_count == 37, f"V1 requires 37 actions, got {action_count}")
+    _require(slot_count == 38, f"V1 requires 38 parameter slots, got {slot_count}")
+    _require(config["relations"]["turn"] == TURN_RELATIONS, "invalid turn relations")
+    _require(config["relations"]["operation"] == OPERATION_RELATIONS, "invalid operation relations")
+    _require(config["lexical_branch"]["vocab_size"] == len(config["lexical_branch"]["vocab"]), "lexical vocab mismatch")
+    for section in ("speech_encoder", "semantic_resampler", "semantic_core", "operation_decoder"):
+        _require(config[section]["d_model"] % config[section]["attention_heads"] == 0, f"{section}.d_model must divide heads")
 
 
 def load_config(path: str | Path = DEFAULT_CONFIG_PATH) -> dict[str, Any]:
-    source = Path(path)
-    config = json.loads(source.read_text(encoding="utf-8"))
-    validate_config(config)
-    return config
+    config = json.loads(Path(path).read_text(encoding="utf-8")); validate_config(config); return config
 
 
 def save_config(config: Mapping[str, Any], path: str | Path = DEFAULT_CONFIG_PATH) -> Path:
-    validate_config(config)
-    destination = Path(path)
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    temporary = destination.with_suffix(destination.suffix + ".tmp")
-    temporary.write_text(json.dumps(config, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    temporary.replace(destination)
-    return destination
-
+    validate_config(config); destination=Path(path); destination.parent.mkdir(parents=True,exist_ok=True); tmp=destination.with_suffix('.tmp'); tmp.write_text(json.dumps(config,ensure_ascii=False,indent=2)+'\n',encoding='utf-8'); tmp.replace(destination); return destination
 
 read_config = load_config
 write_config = save_config
