@@ -49,6 +49,10 @@ def decode_turn_understanding(
 
     schemas = outputs["capability_schemas"]
     schema_names = outputs["schema_names"]
+    confidence_values = outputs["confidence_logits"][0].sigmoid()
+    act_confidence = float(confidence_values[0])
+    goal_confidence = float(confidence_values[1])
+    parameter_confidence = float(confidence_values[2])
     presence = outputs["operation_presence_logits"][0].sigmoid() >= float(config["inference"]["operation_presence_threshold"])
     operations: list[dict[str, Any]] = []
     active_slots: list[int] = []
@@ -126,10 +130,16 @@ def decode_turn_understanding(
         "context": {"relation": relation, "requires_context": requires_context, "reference_type": reference_type},
         "operations": operations,
         "relations": relations,
-        "confidence": {"act": _confidence(act_logits, act_id), "goal": 0.0 if not operations else 1.0, "parameters": 1.0, "ood": float(outputs["ood_logit"][0].sigmoid()), "overall": _confidence(act_logits, act_id)},
+        "confidence": {
+            "act": act_confidence,
+            "goal": goal_confidence,
+            "parameters": parameter_confidence,
+            "ood": float(outputs["ood_logit"][0].sigmoid()),
+            "overall": min(act_confidence, goal_confidence, parameter_confidence),
+        },
     }
     from .dataset import validate_target
-    validate_target(turn, dict(config))
+    validate_target(turn, dict(config), capability_schemas=schemas)
     return turn
 
 
