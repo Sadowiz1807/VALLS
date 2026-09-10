@@ -17,7 +17,7 @@ ROOT_ACTION_DOMAINS = ["APPLICATION_CONTROL", "WEB_CONTROL", "SYSTEM_CONTROL", "
 PARAMETER_TYPES = {"ENUM", "NUMBER", "ENTITY", "FREE_TEXT", "BOOLEAN", "STATE_REFERENCE", "CONTEXT_REFERENCE"}
 TURN_RELATIONS = ["NEW", "APPEND_AFTER", "MODIFY", "SUPERSEDE", "CONTINUE", "REPEAT", "REFERENCE"]
 OPERATION_RELATIONS = ["NONE", "AFTER_SUCCESS", "AFTER_FAILURE", "AFTER_TERMINAL", "AFTER_START"]
-CONTEXT_REFERENCE_TYPES = ["FOCUSED_ACTION", "ACTIVE_APPLICATION", "ACTIVE_BROWSER", "ACTIVE_TAB", "LAST_OPERATION"]
+CONTEXT_REFERENCE_TYPES = ["FOCUSED_ACTION", "ACTIVE_ACTION", "LAST_ACTION", "FOCUSED_TASK_GROUP", "LAST_TASK_GROUP", "RECENT_ACTION"]
 INPUT_SPAN = "INPUT_SPAN"
 STATE_REFERENCE = "STATE_REFERENCE"
 CONTEXT_REFERENCE = "CONTEXT_REFERENCE"
@@ -61,8 +61,8 @@ def _capability(description: str, actions: dict[str, dict[str, Any]]) -> dict[st
     return {"description": description, "actions": actions}
 
 
-def _entity(description: str, required: bool = False) -> dict[str, Any]:
-    return _parameter("ENTITY", description, required=required)
+def _entity(description: str, required: bool = False, state_reference_paths: list[str] | None = None) -> dict[str, Any]:
+    return _parameter("ENTITY", description, required=required, state_reference_paths=state_reference_paths)
 
 
 def _free_text(description: str, required: bool = False) -> dict[str, Any]:
@@ -70,12 +70,12 @@ def _free_text(description: str, required: bool = False) -> dict[str, Any]:
 
 
 def _browser() -> dict[str, Any]:
-    return _entity("Browser name or alias.")
+    return _entity("Browser name or alias.", state_reference_paths=["state.active_browser"])
 
 
 def _default_capabilities() -> dict[str, dict[str, Any]]:
-    app = _entity("Native/local application name or alias.", required=True)
-    optional_app = _entity("Native/local application name or alias.")
+    app = _entity("Native/local application name or alias.", required=True, state_reference_paths=["state.current_target_application"])
+    optional_app = _entity("Native/local application name or alias.", state_reference_paths=["state.current_target_application"])
     browser = _browser()
     return {
         "APPLICATION_CONTROL": _capability(
@@ -95,7 +95,7 @@ def _default_capabilities() -> dict[str, dict[str, Any]]:
         "WEB_CONTROL": _capability(
             "Control browsers, websites, web media, tabs, and navigation.",
             {
-                "OPEN": _action("Open a web target.", {"target": _free_text("URL or web target.", True), "browser": browser}),
+                "OPEN": _action("Open a web target.", {"target": _parameter("FREE_TEXT", "URL or web target.", required=True, state_reference_paths=["state.active_url"]), "browser": browser}),
                 "SEARCH": _action("Search the web.", {"query": _free_text("Search query.", True), "browser": browser, "engine": _entity("Search engine name or alias.")}),
                 "BACK": _action("Navigate back in a browser.", {"browser": browser}),
                 "FORWARD": _action("Navigate forward in a browser.", {"browser": browser}),
@@ -103,8 +103,8 @@ def _default_capabilities() -> dict[str, dict[str, Any]]:
                 "SCROLL_UP": _action("Scroll up in a browser.", {"amount": _parameter("NUMBER", "Scroll amount.", minimum=1, maximum=10), "browser": browser}),
                 "SCROLL_DOWN": _action("Scroll down in a browser.", {"amount": _parameter("NUMBER", "Scroll amount.", minimum=1, maximum=10), "browser": browser}),
                 "TAB.NEW": _action("Open a new browser tab.", {"browser": browser}),
-                "TAB.CLOSE": _action("Close a browser tab.", {"tab_reference": _parameter("CONTEXT_REFERENCE", "Semantic tab reference.", context_reference_types=["ACTIVE_TAB", "FOCUSED_ACTION"])}),
-                "TAB.SWITCH": _action("Switch to a browser tab.", {"tab_reference": _parameter("CONTEXT_REFERENCE", "Semantic tab reference.", required=True, context_reference_types=["ACTIVE_TAB", "FOCUSED_ACTION"])}),
+                "TAB.CLOSE": _action("Close a browser tab.", {"tab_index": _parameter("NUMBER", "One-based tab index."), "tab_query": _parameter("FREE_TEXT", "Tab title or query."), "tab_reference": _parameter("CONTEXT_REFERENCE", "Semantic tab reference.", context_reference_types=["FOCUSED_ACTION", "ACTIVE_ACTION", "LAST_ACTION"])}),
+                "TAB.SWITCH": _action("Switch to a browser tab.", {"tab_index": _parameter("NUMBER", "One-based tab index."), "tab_query": _parameter("FREE_TEXT", "Tab title or query."), "tab_reference": _parameter("CONTEXT_REFERENCE", "Semantic tab reference.", context_reference_types=["FOCUSED_ACTION", "ACTIVE_ACTION", "LAST_ACTION"])}),
                 "TAB.REOPEN": _action("Reopen a browser tab."),
                 "PLAY": _action("Play media through a website or browser.", {"query": _free_text("Media query.", True), "site": _entity("Website or media site."), "browser": browser}),
                 "PAUSE": _action("Pause web media.", {"browser": browser}),
@@ -160,7 +160,7 @@ def get_config() -> dict[str, Any]:
         "speech_encoder": {"architecture": "conformer", "d_model": 512, "layers": 8, "attention_heads": 8, "d_ff": 2048, "dropout": 0.1, "subsampling_factor": 4, "conv_kernel_size": 31},
         "semantic_resampler": {"type": "learnable_query_cross_attention", "latent_tokens": 32, "d_model": 512, "attention_heads": 8, "dropout": 0.1},
         "semantic_core": {"type": "transformer_encoder", "layers": 4, "d_model": 512, "attention_heads": 8, "d_ff": 2048, "dropout": 0.1},
-        "operation_decoder": {"type": "learned_query_cross_attention", "max_operations": 2, "d_model": 512, "attention_heads": 8, "dropout": 0.1},
+        "operation_decoder": {"type": "learned_query_cross_attention", "max_operations": 4, "d_model": 512, "attention_heads": 8, "dropout": 0.1},
         "lexical_branch": {"enabled": True, "type": "ctc_utf8_bytes", "vocab_size": len(lexical_vocab), "blank_id": 0, "vocab_artifact": "lexical_vocab.json", "vocab": lexical_vocab},
         "model": {"architecture": MODEL_ARCHITECTURE, "d_model": 512, "gradient_checkpointing": True},
         "ontology": {"acts": list(ACTS), "root_action_domains": list(ROOT_ACTION_DOMAINS), "capabilities": capabilities, "schema_order": list(capabilities)},
@@ -203,7 +203,9 @@ def validate_config(config: Mapping[str, Any]) -> None:
                 if parameter["type"] == "ENUM":
                     _require(isinstance(parameter.get("values"), list) and parameter["values"], f"ENUM requires values: {canonical}.{name}")
     _require(action_count == 37, f"V1 requires 37 actions, got {action_count}")
-    _require(slot_count == 38, f"V1 requires 38 parameter slots, got {slot_count}")
+    # TAB.CLOSE/TAB.SWITCH expose three mutually exclusive target mechanisms
+    # (tab_index, tab_query, tab_reference), yielding 42 explicit slots.
+    _require(slot_count == 42, f"V1 requires 42 parameter slots with tab target alternatives, got {slot_count}")
     _require(config["relations"]["turn"] == TURN_RELATIONS, "invalid turn relations")
     _require(config["relations"]["operation"] == OPERATION_RELATIONS, "invalid operation relations")
     _require(config["lexical_branch"]["vocab_size"] == len(config["lexical_branch"]["vocab"]), "lexical vocab mismatch")

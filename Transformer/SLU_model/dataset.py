@@ -139,7 +139,7 @@ def _validate_parameter(
         if source == "input_span":
             _validate_input_span(value, transcript)
         elif source == "state_reference":
-            allowed_paths = schema.get("state_reference_paths", ["state.current_target_application", "state.active_browser", "state.active_url", "state.active_media"])
+            allowed_paths = schema.get("state_reference_paths", [])
             if value.get("path") not in allowed_paths:
                 raise DatasetContractError(f"state reference is not allowlisted for {domain}.{action_path}.{name}")
         else:
@@ -147,7 +147,7 @@ def _validate_parameter(
     elif parameter_type == "STATE_REFERENCE":
         if not isinstance(value, Mapping) or value.get("source") != "state_reference":
             raise DatasetContractError(f"{domain}.{action_path}.{name} requires state_reference")
-        allowed_paths = schema.get("state_reference_paths", ["state.current_target_application", "state.active_browser", "state.active_url", "state.active_media"])
+        allowed_paths = schema.get("state_reference_paths", [])
         if value.get("path") not in allowed_paths:
             raise DatasetContractError(f"state reference is not allowlisted for {domain}.{action_path}.{name}")
     elif parameter_type == "CONTEXT_REFERENCE":
@@ -171,7 +171,9 @@ def validate_target(
     } if capability_schemas is not None else {
         str(name): schema for name, schema in config["ontology"]["capabilities"].items()
     }
-    context = target.get("context", {})
+    if "context" not in target:
+        raise DatasetContractError("V1 target.context is required")
+    context = target["context"]
     requires_context = False
     if context:
         if not isinstance(context, Mapping):
@@ -196,10 +198,8 @@ def validate_target(
             raise DatasetContractError("each operation must be an object")
         if operation.get("order", order) != order:
             raise DatasetContractError("operation order must be contiguous and 1-based")
-        domain = operation.get("domain", operation.get("goal"))
+        domain = operation.get("domain")
         action_id = operation.get("action")
-        if domain and action_id and "." not in str(action_id):
-            action_id = f"{domain}.{action_id}"
         if not isinstance(domain, str) or domain not in schemas:
             raise DatasetContractError(f"unknown root action domain: {domain!r}")
         prefix = f"{domain}."
@@ -207,10 +207,9 @@ def validate_target(
             raise DatasetContractError(f"action is not canonical for domain {domain}: {action_id!r}")
         action_path = action_id[len(prefix):]
         action_collection = schemas[domain].get("actions", {})
-        if isinstance(action_collection, Mapping):
-            action_schema = action_collection.get(action_path)
-        else:
-            action_schema = {"parameters": schemas[domain].get("parameters", {})} if action_path in action_collection else None
+        if not isinstance(action_collection, Mapping):
+            raise DatasetContractError(f"{domain}.actions must be an action mapping")
+        action_schema = action_collection.get(action_path)
         if action_schema is None:
             raise DatasetContractError(f"unknown action: {action_id}")
         parameters = operation.get("parameters", {})
@@ -228,6 +227,9 @@ def validate_target(
                     raise DatasetContractError(f"missing required parameter {action_id}.{name}")
                 continue
             _validate_parameter(domain, action_path, name, parameters[name], parameter_schema, transcript)
+        if domain == "WEB_CONTROL" and action_path in {"TAB.CLOSE", "TAB.SWITCH"}:
+            if not any(name in parameters for name in ("tab_index", "tab_query", "tab_reference")) and not requires_context:
+                raise DatasetContractError(f"{action_id} requires tab_index, tab_query, or tab_reference")
 
     if target["act"] == "EXECUTE" and not operations:
         raise DatasetContractError("EXECUTE requires at least one operation")
@@ -237,14 +239,34 @@ def validate_target(
     relations = target.get("relations", [])
     if not isinstance(relations, list):
         raise DatasetContractError("target.relations must be a list")
+    edges: set[tuple[int, int, str]] = set()
+    adjacency: dict[int, set[int]] = {index: set() for index in range(len(operations))}
     for relation in relations:
         if not isinstance(relation, Mapping):
             raise DatasetContractError("operation relation must be an object")
-        source, destination = relation.get("source"), relation.get("target")
+        source, destination, relation_type = relation.get("source"), relation.get("target"), relation.get("type")
         if not isinstance(source, int) or not isinstance(destination, int) or not 0 <= source < len(operations) or not 0 <= destination < len(operations):
             raise DatasetContractError("operation relation endpoints are invalid")
-        if relation.get("type") not in OPERATION_RELATIONS:
+        if source == destination:
+            raise DatasetContractError("operation relation cannot be a self-edge")
+        if relation_type == "NONE":
+            raise DatasetContractError("NONE relation must not be persisted as an edge")
+        if relation_type not in OPERATION_RELATIONS:
             raise DatasetContractError("unknown operation relation")
+        edge = (source, destination, str(relation_type))
+        if edge in edges:
+            raise DatasetContractError("duplicate operation relation")
+        edges.add(edge); adjacency[source].add(destination)
+    visiting: set[int] = set(); visited: set[int] = set()
+    def visit(node: int) -> None:
+        if node in visiting:
+            raise DatasetContractError("operation dependency relations must be acyclic")
+        if node in visited:
+            return
+        visiting.add(node)
+        for child in adjacency[node]: visit(child)
+        visiting.remove(node); visited.add(node)
+    for node in adjacency: visit(node)
 
 
 def validate_record(record: dict[str, Any], config: dict[str, Any], *, require_semantic: bool = False) -> None:

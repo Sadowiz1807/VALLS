@@ -432,7 +432,9 @@ class ActionResolver(nn.Module):
         scores: list[Tensor] = []
         for schema in schemas:
             action_value = schema.get("actions", {})
-            actions = list(action_value.items()) if isinstance(action_value, Mapping) else [(str(action), {"description": str(action), "parameters": schema.get("parameters", {})}) for action in action_value]
+            if not isinstance(action_value, Mapping):
+                raise ValueError(f"{schema.get('name')}.actions must be an action mapping")
+            actions = list(action_value.items())
             if not actions:
                 raise ValueError(f"schema {schema.get('name')} has no actions")
             embeddings = self.schema_encoder.encode_texts(
@@ -535,7 +537,9 @@ class TypedParameterExtractor(nn.Module):
             domain = str(schema["name"])
             result[domain] = {}
             actions_value = schema.get("actions", {})
-            actions = actions_value.items() if isinstance(actions_value, Mapping) else ((str(path), {"description": str(path), "parameters": schema.get("parameters", {})}) for path in actions_value)
+            if not isinstance(actions_value, Mapping):
+                raise ValueError(f"{schema.get('name')}.actions must be an action mapping")
+            actions = actions_value.items()
             for action_path, action in actions:
                 action_embedding = self.schema_encoder.encode_texts(
                     [self.schema_encoder.action_text(domain, schema, action_path, action)], operation_queries.device
@@ -543,8 +547,6 @@ class TypedParameterExtractor(nn.Module):
                 action_conditioned = torch.cat([operation_queries, action_embedding.view(1, 1, -1).expand_as(operation_queries)], dim=-1)
                 result[domain][action_path] = {}
                 action_parameters = action.get("parameters", {})
-                if not action_parameters and isinstance(schema.get("parameters"), Mapping):
-                    action_parameters = schema["parameters"]
                 for name, parameter in action_parameters.items():
                     parameter_embedding = self.schema_encoder.encode_texts(
                         [f"{domain} {action_path} parameter {name} type {parameter['type']} {parameter.get('description', '')}"], operation_queries.device
