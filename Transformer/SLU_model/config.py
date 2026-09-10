@@ -103,8 +103,8 @@ def _default_capabilities() -> dict[str, dict[str, Any]]:
                 "SCROLL_UP": _action("Scroll up in a browser.", {"amount": _parameter("NUMBER", "Scroll amount.", minimum=1, maximum=10), "browser": browser}),
                 "SCROLL_DOWN": _action("Scroll down in a browser.", {"amount": _parameter("NUMBER", "Scroll amount.", minimum=1, maximum=10), "browser": browser}),
                 "TAB.NEW": _action("Open a new browser tab.", {"browser": browser}),
-                "TAB.CLOSE": _action("Close a browser tab.", {"tab_reference": _parameter("CONTEXT_REFERENCE", "Semantic tab reference.", context_reference_types=["FOCUSED_ACTION", "ACTIVE_ACTION", "LAST_ACTION"])}),
-                "TAB.SWITCH": _action("Switch to a browser tab.", {"tab_reference": _parameter("CONTEXT_REFERENCE", "Semantic tab reference.", required=True, context_reference_types=["FOCUSED_ACTION", "ACTIVE_ACTION", "LAST_ACTION"])}),
+                "TAB.CLOSE": _action("Close a browser tab.", {"tab_index": _parameter("NUMBER", "One-based tab index."), "tab_query": _parameter("FREE_TEXT", "Tab title or query."), "tab_reference": _parameter("CONTEXT_REFERENCE", "Semantic tab reference.", context_reference_types=["FOCUSED_ACTION", "ACTIVE_ACTION", "LAST_ACTION"])}),
+                "TAB.SWITCH": _action("Switch to a browser tab.", {"tab_index": _parameter("NUMBER", "One-based tab index."), "tab_query": _parameter("FREE_TEXT", "Tab title or query."), "tab_reference": _parameter("CONTEXT_REFERENCE", "Semantic tab reference.", context_reference_types=["FOCUSED_ACTION", "ACTIVE_ACTION", "LAST_ACTION"])}),
                 "TAB.REOPEN": _action("Reopen a browser tab."),
                 "PLAY": _action("Play media through a website or browser.", {"query": _free_text("Media query.", True), "site": _entity("Website or media site."), "browser": browser}),
                 "PAUSE": _action("Pause web media.", {"browser": browser}),
@@ -203,7 +203,9 @@ def validate_config(config: Mapping[str, Any]) -> None:
                 if parameter["type"] == "ENUM":
                     _require(isinstance(parameter.get("values"), list) and parameter["values"], f"ENUM requires values: {canonical}.{name}")
     _require(action_count == 37, f"V1 requires 37 actions, got {action_count}")
-    _require(slot_count == 38, f"V1 requires 38 parameter slots, got {slot_count}")
+    # TAB.CLOSE/TAB.SWITCH expose three mutually exclusive target mechanisms
+    # (tab_index, tab_query, tab_reference), yielding 42 explicit slots.
+    _require(slot_count == 42, f"V1 requires 42 parameter slots with tab target alternatives, got {slot_count}")
     _require(config["relations"]["turn"] == TURN_RELATIONS, "invalid turn relations")
     _require(config["relations"]["operation"] == OPERATION_RELATIONS, "invalid operation relations")
     _require(config["lexical_branch"]["vocab_size"] == len(config["lexical_branch"]["vocab"]), "lexical vocab mismatch")

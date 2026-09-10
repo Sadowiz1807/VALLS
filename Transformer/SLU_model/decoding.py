@@ -51,9 +51,12 @@ def decode_turn_understanding(
     schema_names = outputs["schema_names"]
     presence = outputs["operation_presence_logits"][0].sigmoid() >= float(config["inference"]["operation_presence_threshold"])
     operations: list[dict[str, Any]] = []
+    active_slots: list[int] = []
     for index in range(outputs["operation_queries"].size(1)):
         if not bool(presence[index]):
             continue
+        active_slots.append(index)
+        compact_order = len(active_slots)
         goal_scores = outputs["goal_scores"][0, index]
         schema_index = int(goal_scores.argmax())
         domain = schema_names[schema_index]
@@ -106,18 +109,18 @@ def decode_turn_understanding(
                     raise DatasetContractError(f"invalid source prediction for {action_id}.{name}")
             else:
                 raise DatasetContractError(f"unsupported parameter type: {kind}")
-        operations.append({"order": index + 1, "domain": domain, "action": action_id, "parameters": parameters})
+        operations.append({"order": compact_order, "domain": domain, "action": action_id, "parameters": parameters})
 
     relations: list[dict[str, Any]] = []
     relation_logits = outputs["operation_relation_logits"][0]
-    for source in range(len(operations)):
-        for destination in range(len(operations)):
+    for source, original_source in enumerate(active_slots):
+        for destination, original_destination in enumerate(active_slots):
             if source == destination:
                 continue
-            relation_id = int(relation_logits[source, destination].argmax())
+            relation_id = int(relation_logits[original_source, original_destination].argmax())
             if relation_id:
                 relations.append({"source": source, "target": destination, "type": OPERATION_RELATIONS[relation_id]})
-    return {
+    turn = {
         "request_id": request_id,
         "act": act,
         "context": {"relation": relation, "requires_context": requires_context, "reference_type": reference_type},
@@ -125,6 +128,9 @@ def decode_turn_understanding(
         "relations": relations,
         "confidence": {"act": _confidence(act_logits, act_id), "goal": 0.0 if not operations else 1.0, "parameters": 1.0, "ood": float(outputs["ood_logit"][0].sigmoid()), "overall": _confidence(act_logits, act_id)},
     }
+    from .dataset import validate_target
+    validate_target(turn, dict(config))
+    return turn
 
 
 # Short name for callers that already own the model/output boundary.

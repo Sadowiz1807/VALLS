@@ -171,7 +171,9 @@ def validate_target(
     } if capability_schemas is not None else {
         str(name): schema for name, schema in config["ontology"]["capabilities"].items()
     }
-    context = target.get("context", {})
+    if "context" not in target:
+        raise DatasetContractError("V1 target.context is required")
+    context = target["context"]
     requires_context = False
     if context:
         if not isinstance(context, Mapping):
@@ -225,6 +227,9 @@ def validate_target(
                     raise DatasetContractError(f"missing required parameter {action_id}.{name}")
                 continue
             _validate_parameter(domain, action_path, name, parameters[name], parameter_schema, transcript)
+        if domain == "WEB_CONTROL" and action_path in {"TAB.CLOSE", "TAB.SWITCH"}:
+            if not any(name in parameters for name in ("tab_index", "tab_query", "tab_reference")) and not requires_context:
+                raise DatasetContractError(f"{action_id} requires tab_index, tab_query, or tab_reference")
 
     if target["act"] == "EXECUTE" and not operations:
         raise DatasetContractError("EXECUTE requires at least one operation")

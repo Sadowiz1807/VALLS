@@ -423,6 +423,7 @@ def validate_model(model: VoiceNativeSLU, batches: Iterable[Mapping[str, Any]], 
     frame_correct = count_correct = 0
     turn_relation_correct = context_required_correct = context_reference_correct = operation_graph_exact = 0
     turn_relation_total = context_reference_total = 0
+    turn_understanding_exact_count = 0
     ctc_invalid = ctc_samples = 0
     total_loss = 0.0
     with torch.no_grad():
@@ -466,9 +467,14 @@ def validate_model(model: VoiceNativeSLU, batches: Iterable[Mapping[str, Any]], 
                                 predicted_relations.add((source, destination, OPERATION_RELATIONS[relation_id]))
                 graph_exact = gold_relations == predicted_relations
                 operation_graph_exact += int(graph_exact)
-                frame_correct += int(exact and graph_exact and turn_relation_correct == turn_relation_total)
+                turn_relation_match = TURN_RELATIONS[int(outputs["turn_relation_logits"][row].argmax())] == target.get("context", {}).get("relation", "NEW")
+                context_required_match = bool(outputs["context_required_logit"][row].sigmoid() >= 0.5) == bool(target.get("context", {}).get("requires_context", False))
+                expected_reference = target.get("context", {}).get("reference_type")
+                context_reference_match = expected_reference is None or config["relations"]["context_reference_types"][int(outputs["context_reference_logits"][row].argmax())] == expected_reference
+                turn_understanding_exact_count += int(exact and graph_exact and turn_relation_match and context_required_match and context_reference_match)
+                frame_correct += int(exact and graph_exact and turn_relation_match and context_required_match and context_reference_match)
     if not samples: raise ValueError("no validation batches")
-    return {"validation_loss": total_loss / samples, "act_accuracy": act_correct / samples, "goal_retrieval_accuracy": goal_correct / max(goal_total,1), "action_accuracy": action_correct / max(action_total,1), "parameter_presence_accuracy": presence_correct / max(presence_total,1), "parameter_accuracy": parameter_correct / max(parameter_total,1), "operation_presence_accuracy": operation_correct / max(operation_total,1), "operation_count_accuracy": count_correct / samples, "turn_relation_accuracy": turn_relation_correct / max(turn_relation_total,1), "context_required_accuracy": context_required_correct / samples, "context_reference_accuracy": context_reference_correct / max(context_reference_total,1), "operation_graph_exact_accuracy": operation_graph_exact / samples, "turn_understanding_exact_accuracy": frame_correct / samples, "semantic_frame_exact_accuracy": frame_correct / samples, "unsafe_false_execute_rate": unsafe / samples, "ctc_invalid_ratio": ctc_invalid / max(ctc_samples,1)}
+    return {"validation_loss": total_loss / samples, "act_accuracy": act_correct / samples, "goal_retrieval_accuracy": goal_correct / max(goal_total,1), "action_accuracy": action_correct / max(action_total,1), "parameter_presence_accuracy": presence_correct / max(presence_total,1), "parameter_accuracy": parameter_correct / max(parameter_total,1), "operation_presence_accuracy": operation_correct / max(operation_total,1), "operation_count_accuracy": count_correct / samples, "turn_relation_accuracy": turn_relation_correct / max(turn_relation_total,1), "context_required_accuracy": context_required_correct / samples, "context_reference_accuracy": context_reference_correct / max(context_reference_total,1), "operation_graph_exact_accuracy": operation_graph_exact / samples, "turn_understanding_exact_accuracy": turn_understanding_exact_count / samples, "semantic_frame_exact_accuracy": frame_correct / samples, "unsafe_false_execute_rate": unsafe / samples, "ctc_invalid_ratio": ctc_invalid / max(ctc_samples,1)}
 
 
 def assemble_frame(prediction: Mapping[str, Any], config: Mapping[str, Any], *, request_id: str | None = None, model_version: str | None = None, capability_schemas: Sequence[Mapping[str, Any]] | None = None) -> dict[str, Any]:
